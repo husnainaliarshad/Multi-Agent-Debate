@@ -1,15 +1,19 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain.chat_models import init_chat_model
+from typing import Optional, Dict, Any
+import json
+from config import DebateConfig, AgentConfig, Settings
+from agents import DebateOrchestrator
 from dotenv import load_dotenv
 import os
+import threading
 
 # Load environment variables
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(title="Multi-Agent Debate API")
 
 # Enable CORS
 app.add_middleware(
@@ -20,44 +24,106 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize the model
-try:
-    model = init_chat_model(
-        os.getenv("MODEL_NAME", "liquid/lfm2.5-1.2b"),
-        model_provider=os.getenv("MODEL_PROVIDER", "openai"),
-        base_url=os.getenv("BASE_URL", "http://localhost:1234/v1"),
-        api_key=os.getenv("API_KEY", "lm-studio"),
-        temperature=float(os.getenv("TEMPERATURE", "0"))
-    )
-except Exception as e:
-    print(f"Warning: Failed to initialize model: {e}")
-    model = None
+# In-memory session storage
+sessions: Dict[str, DebateOrchestrator] = {}
+session_results: Dict[str, Dict[str, Any]] = {}
+session_locks: Dict[str, threading.Lock] = {}
 
 # Pydantic schemas
-class ChatRequest(BaseModel):
-    message: str
+class DebateInitRequest(BaseModel):
+    topic: str
+    proposer_model: Optional[str] = "liquid/lfm2.5-1.2b"
+    critic_model: Optional[str] = "liquid/lfm2.5-1.2b"
+    judge_model: Optional[str] = "liquid/lfm2.5-1.2b"
+    proposer_temperature: Optional[float] = 0.7
+    critic_temperature: Optional[float] = 0.7
+    judge_temperature: Optional[float] = 0.5
+    proposer_prompt: Optional[str] = None
+    critic_prompt: Optional[str] = None
+    judge_prompt: Optional[str] = None
+    max_rounds: Optional[int] = 1
+    max_tokens: Optional[int] = 500
 
-class ChatResponse(BaseModel):
-    response: str
+class DebateInitResponse(BaseModel):
+    session_id: str
+    status: str
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Process a chat message using the local LLM."""
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="LM Studio is not running or model initialization failed. Please start LM Studio and load the model."
-        )
-    
+@app.post("/debate/init", response_model=DebateInitResponse)
+def init_debate(request: DebateInitRequest):
+    """Initialize a new debate session."""
     try:
-        response = model.invoke(request.message)
-        return ChatResponse(response=str(response.content))
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Failed to generate response: {str(e)}. Ensure LM Studio is running on http://localhost:1234"
+        # Create debate configuration
+        config = DebateConfig(
+            proposer=AgentConfig(
+                model=request.proposer_model,
+                temperature=request.proposer_temperature,
+                system_prompt=request.proposer_prompt or ""
+            ),
+            critic=AgentConfig(
+                model=request.critic_model,
+                temperature=request.critic_temperature,
+                system_prompt=request.critic_prompt or ""
+            ),
+            judge=AgentConfig(
+                model=request.judge_model,
+                temperature=request.judge_temperature,
+                system_prompt=request.judge_prompt or ""
+            ),
+            max_rounds=request.max_rounds,
+            model_provider=os.getenv("MODEL_PROVIDER", "openai"),
+            base_url=os.getenv("BASE_URL", "http://localhost:1234/v1"),
+            api_key=os.getenv("API_KEY", "lm-studio")
         )
+        
+        # Create orchestrator with max_tokens
+        orchestrator = DebateOrchestrator(config, max_tokens=request.max_tokens or 500)
+        session_id = orchestrator.session_id
+        
+        # Store session
+        sessions[session_id] = orchestrator
+        session_locks[session_id] = threading.Lock()
+        
+        # Run debate in background thread
+        thread = threading.Thread(target=run_debate_background, args=(orchestrator, request.topic))
+        thread.start()
+        
+        return DebateInitResponse(session_id=session_id, status="initialized")
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize debate: {str(e)}")
+
+def run_debate_background(orchestrator: DebateOrchestrator, topic: str):
+    """Run debate in background and store results."""
+    try:
+        result = orchestrator.run_debate(topic)
+        session_results[orchestrator.session_id] = result
+    except Exception as e:
+        session_results[orchestrator.session_id] = {
+            "error": str(e),
+            "session_id": orchestrator.session_id
+        }
+
+@app.get("/debate/events/{session_id}")
+def get_debate_events(session_id: str):
+    """Get all events for a debate session."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    orchestrator = sessions[session_id]
+    return {
+        "session_id": session_id,
+        "events": orchestrator.events,
+        "complete": session_id in session_results
+    }
+
+@app.get("/debate/result/{session_id}")
+def get_debate_result(session_id: str):
+    """Get the final result of a debate."""
+    if session_id not in session_results:
+        raise HTTPException(status_code=404, detail="Result not available yet")
+    
+    return session_results[session_id]
 
 @app.get("/")
-async def root():
+def root():
     return {"status": "running", "message": "Multi-Agent Debate Backend API"}
