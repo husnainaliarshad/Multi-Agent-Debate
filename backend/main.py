@@ -1,8 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import json
+import requests
 from config import DebateConfig, AgentConfig, Settings
 from agents import DebateOrchestrator
 from dotenv import load_dotenv
@@ -123,6 +124,40 @@ def get_debate_result(session_id: str):
         raise HTTPException(status_code=404, detail="Result not available yet")
     
     return session_results[session_id]
+
+@app.get("/models")
+def get_available_models():
+    """Get available models from LM Studio."""
+    try:
+        base_url = os.getenv("BASE_URL", "http://localhost:1234/v1")
+        print(f"Fetching models from: {base_url}/models")
+        response = requests.get(f"{base_url}/models", timeout=5)
+        
+        print(f"Response status: {response.status_code}")
+        print(f"Response body: {response.text}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            print(f"Parsed data: {data}")
+            models = data.get("data", [])
+            model_names = [model.get("id", "") for model in models]
+            print(f"Model names: {model_names}")
+            return {"models": model_names}
+        else:
+            # Return default models if LM Studio is not responding
+            return {
+                "models": ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
+                "warning": f"Could not connect to LM Studio (status {response.status_code}), using default models"
+            }
+    except Exception as e:
+        # Return default models on error
+        print(f"Error fetching models: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "models": ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
+            "warning": f"Error fetching models: {str(e)}"
+        }
 
 @app.get("/")
 def root():

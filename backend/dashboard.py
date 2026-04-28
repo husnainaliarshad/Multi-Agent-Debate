@@ -62,23 +62,59 @@ if "debate_result" not in st.session_state:
 # Sidebar configuration
 st.sidebar.title("⚙️ Debate Configuration")
 
+# Fetch available models from LM Studio
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def get_available_models():
+    """Fetch available models from the backend."""
+    try:
+        response = requests.get(f"{API_BASE}/models", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if "warning" in data:
+                st.warning(data["warning"])
+            return data.get("models", ["liquid/lfm2.5-1.2b"])
+        return ["liquid/lfm2.5-1.2b"]
+    except:
+        return ["liquid/lfm2.5-1.2b"]
+
 # Model selection
 st.sidebar.subheader("Model Selection")
-proposer_model = st.sidebar.selectbox(
-    "Proposer Model",
-    ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
-    index=0
-)
-critic_model = st.sidebar.selectbox(
-    "Critic Model",
-    ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
-    index=0
-)
-judge_model = st.sidebar.selectbox(
-    "Judge Model",
-    ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
-    index=0
-)
+
+# Add refresh button
+col_refresh, col_info = st.sidebar.columns([1, 3])
+with col_refresh:
+    refresh_models = st.button("🔄", help="Refresh models from LM Studio")
+with col_info:
+    st.write("")
+
+# Clear cache and re-fetch if refresh button clicked
+if refresh_models:
+    st.cache_data.clear()
+    st.rerun()
+
+available_models = get_available_models()
+
+if len(available_models) > 0:
+    proposer_model = st.sidebar.selectbox(
+        "Proposer Model",
+        available_models,
+        index=0
+    )
+    critic_model = st.sidebar.selectbox(
+        "Critic Model",
+        available_models,
+        index=0
+    )
+    judge_model = st.sidebar.selectbox(
+        "Judge Model",
+        available_models,
+        index=0
+    )
+else:
+    st.sidebar.error("No models available. Check LM Studio connection.")
+    proposer_model = "liquid/lfm2.5-1.2b"
+    critic_model = "liquid/lfm2.5-1.2b"
+    judge_model = "liquid/lfm2.5-1.2b"
 
 # Temperature sliders
 st.sidebar.subheader("Temperature Settings")
