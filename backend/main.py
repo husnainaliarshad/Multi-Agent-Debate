@@ -31,15 +31,18 @@ session_results: Dict[str, Dict[str, Any]] = {}
 session_locks: Dict[str, threading.Lock] = {}
 
 # Pydantic schemas
+class ProposerConfig(BaseModel):
+    model: str = "liquid/lfm2.5-1.2b"
+    temperature: float = 0.7
+    system_prompt: Optional[str] = None
+
 class DebateInitRequest(BaseModel):
     topic: str
-    proposer_model: Optional[str] = "liquid/lfm2.5-1.2b"
+    proposers: list[ProposerConfig] = [ProposerConfig()]
     critic_model: Optional[str] = "liquid/lfm2.5-1.2b"
     judge_model: Optional[str] = "liquid/lfm2.5-1.2b"
-    proposer_temperature: Optional[float] = 0.7
     critic_temperature: Optional[float] = 0.7
     judge_temperature: Optional[float] = 0.5
-    proposer_prompt: Optional[str] = None
     critic_prompt: Optional[str] = None
     judge_prompt: Optional[str] = None
     max_rounds: Optional[int] = 1
@@ -53,22 +56,32 @@ class DebateInitResponse(BaseModel):
 def init_debate(request: DebateInitRequest):
     """Initialize a new debate session."""
     try:
+        # Create proposer configs
+        proposer_configs = [
+            AgentConfig(
+                model=p.model,
+                temperature=p.temperature,
+                system_prompt=p.system_prompt or "You are a Proposer in a structured debate. Your role is to generate a well-reasoned legal argument on the given topic."
+            )
+            for p in request.proposers
+        ]
+        
         # Create debate configuration
         config = DebateConfig(
-            proposer=AgentConfig(
-                model=request.proposer_model,
-                temperature=request.proposer_temperature,
-                system_prompt=request.proposer_prompt or ""
+            proposer=proposer_configs[0] if proposer_configs else AgentConfig(
+                model="liquid/lfm2.5-1.2b",
+                temperature=0.7,
+                system_prompt="You are a Proposer in a structured debate. Your role is to generate a well-reasoned legal argument on the given topic."
             ),
             critic=AgentConfig(
                 model=request.critic_model,
                 temperature=request.critic_temperature,
-                system_prompt=request.critic_prompt or ""
+                system_prompt=request.critic_prompt or "You are a Critic in a structured debate. Your role is to identify logical fallacies, counter-points, and weaknesses in the Proposer's argument."
             ),
             judge=AgentConfig(
                 model=request.judge_model,
                 temperature=request.judge_temperature,
-                system_prompt=request.judge_prompt or ""
+                system_prompt=request.judge_prompt or "You are a Judge in a structured debate. Your role is to synthesize both the Proposer's and Critic's arguments and provide a balanced verdict."
             ),
             max_rounds=request.max_rounds,
             model_provider=os.getenv("MODEL_PROVIDER", "openai"),
@@ -76,8 +89,13 @@ def init_debate(request: DebateInitRequest):
             api_key=os.getenv("API_KEY", "lm-studio")
         )
         
-        # Create orchestrator with max_tokens
-        orchestrator = DebateOrchestrator(config, max_tokens=request.max_tokens or 500)
+        # Create orchestrator with multiple proposers and rounds
+        orchestrator = DebateOrchestrator(
+            config,
+            max_tokens=request.max_tokens or 500,
+            proposer_configs=proposer_configs,
+            num_rounds=request.max_rounds or 1
+        )
         session_id = orchestrator.session_id
         
         # Store session
