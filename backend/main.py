@@ -4,9 +4,9 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import json
 import requests
-from config import DebateConfig, AgentConfig, Settings
+from config import DebateConfig, AgentConfig, Settings, JUDGE_PROFILES
 from agents import DebateOrchestrator
-from database import init_db, get_debate_events, get_recent_debates, delete_debate_session
+from database import init_db, get_debate_events, get_recent_debates, delete_debate_session, save_debate_session
 from dotenv import load_dotenv
 import os
 import threading
@@ -16,7 +16,6 @@ load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(title="Multi-Agent Debate API")
-init_db()
 
 # Enable CORS
 app.add_middleware(
@@ -26,6 +25,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
 # In-memory session storage
 sessions: Dict[str, DebateOrchestrator] = {}
@@ -47,6 +51,9 @@ class DebateInitRequest(BaseModel):
     judge_temperature: Optional[float] = 0.5
     critic_prompt: Optional[str] = None
     judge_prompt: Optional[str] = None
+    judge_profile: Optional[str] = "default"
+    use_position_swap: Optional[bool] = True
+    use_info_gain: Optional[bool] = True
     max_rounds: Optional[int] = 1
     max_tokens: Optional[int] = 500
     use_search: Optional[bool] = True
@@ -69,6 +76,11 @@ def init_debate(request: DebateInitRequest):
             for p in request.proposers
         ]
         
+        # Get judge system prompt from profile or custom prompt
+        judge_system_prompt = request.judge_prompt
+        if not judge_system_prompt:
+            judge_system_prompt = JUDGE_PROFILES.get(request.judge_profile, JUDGE_PROFILES["default"])
+        
         # Create debate configuration
         config = DebateConfig(
             proposer=proposer_configs[0] if proposer_configs else AgentConfig(
@@ -84,7 +96,7 @@ def init_debate(request: DebateInitRequest):
             judge=AgentConfig(
                 model=request.judge_model,
                 temperature=request.judge_temperature,
-                system_prompt=request.judge_prompt or "You are a Judge in a structured debate. Your role is to synthesize both the Proposer's and Critic's arguments and provide a balanced verdict."
+                system_prompt=judge_system_prompt
             ),
             max_rounds=request.max_rounds,
             model_provider=os.getenv("MODEL_PROVIDER", "openai"),
@@ -98,7 +110,9 @@ def init_debate(request: DebateInitRequest):
             max_tokens=request.max_tokens or 500,
             proposer_configs=proposer_configs,
             num_rounds=request.max_rounds or 1,
-            use_search=request.use_search or False
+            use_search=request.use_search or False,
+            use_position_swap=request.use_position_swap or True,
+            use_info_gain=request.use_info_gain or True
         )
         session_id = orchestrator.session_id
         
@@ -120,11 +134,13 @@ def run_debate_background(orchestrator: DebateOrchestrator, topic: str):
     try:
         result = orchestrator.run_debate(topic)
         session_results[orchestrator.session_id] = result
+        print(f"[{orchestrator.session_id}] Debate complete")
     except Exception as e:
         session_results[orchestrator.session_id] = {
             "error": str(e),
             "session_id": orchestrator.session_id
         }
+        print(f"[{orchestrator.session_id}] Error in background thread: {e}")
 
 @app.get("/debate/events/{session_id}")
 def get_debate_events_endpoint(session_id: str):
@@ -159,6 +175,26 @@ def get_debate_result(session_id: str, wait_seconds: int = 5):
         raise HTTPException(status_code=404, detail="Result not available yet")
     
     return session_results[session_id]
+
+class SaveDebateRequest(BaseModel):
+    session_id: str
+    topic: str
+    events: list
+    result: dict
+
+@app.post("/debate/save")
+def save_debate_endpoint(request: SaveDebateRequest):
+    """Save a debate session to the database."""
+    try:
+        save_debate_session(
+            request.session_id,
+            request.topic,
+            request.events,
+            request.result
+        )
+        return {"message": "Debate saved successfully", "session_id": request.session_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save debate: {str(e)}")
 
 @app.delete("/debate/{session_id}")
 def delete_debate_endpoint(session_id: str):
@@ -212,6 +248,24 @@ def get_available_models():
             "models": ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
             "warning": f"Error fetching models: {str(e)}"
         }
+
+@app.get("/debate/dummy")
+def dummy_debate():
+    """Return a dummy debate result for testing the frontend."""
+    return {
+        "session_id": "dummy_session_123",
+        "proposer_responses": [["This is a dummy proposer argument about the topic."]],
+        "critic_responses": [["This is a dummy critic critique of the argument."]],
+        "judge_response": "This is a dummy judge verdict with a consensus score.",
+        "consensus_score": 75,
+        "verdict": "Partially valid",
+        "num_proposers": 1,
+        "num_rounds": 1,
+        "events": [
+            {"event_type": "DEBATE_START", "data": {"topic": "Dummy Topic"}, "timestamp": 1234567890},
+            {"event_type": "PROPOSER_FINAL", "data": {"response": "Dummy response"}, "timestamp": 1234567891}
+        ]
+    }
 
 @app.get("/")
 def root():

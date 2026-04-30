@@ -1,0 +1,42 @@
+Mitigating the Judge's Self-Preference Bias
+Using a LLM as a judge introduces a severe "Self-Preference Bias" (SPB), where the model
+systematically favors arguments that match its own generative style. To mitigate this in a
+zero-shot environment:
+●​ Black-Box Perturbations: Before passing the Proposer's and Critic's arguments to the
+Judge, apply automated perturbations—such as synonym replacement or
+paraphrasing—to neutralize stylistic differences and obfuscate the "authorship" of the
+text.
+●​ Cognitive Load Decomposition: Do not ask the Judge for a single, holistic score.
+Instead, use a structured, multi-dimensional evaluation strategy that forces the Judge to
+independently evaluate specific legal elements (e.g., "Rate the validity of the Rule cited,"
+then "Rate the logical Application") to reduce cognitive overload and bias.
+●​ Position Swapping: To prevent position bias, run the Judge evaluation twice for each
+round, swapping the order of the Proposer's and Critic's responses in the prompt, and
+average the normalized probability scores of the Judge's verdict.
+
+Controlling Context Windows and Preventing Hallucination Loops
+●​ Adaptive Sparse Communication: Instead of appending the full, verbose chat history
+at every turn, gate interactions using a preference score that mixes the agent's
+confidence with the "information gain" of the new turn. If a turn does not offer sufficient
+new information, it is pruned from the context.
+●​ Summary-Based Relay: Divide the debate into sub-stages where agents are forced to
+produce condensed summaries of their arguments before passing them to the next
+agent, significantly reducing token bloat.
+
+Evaluation Metrics
+●​ Information Gain (Cosine Dissimilarity): Measure the cosine dissimilarity between the
+embeddings of consecutive agent responses. This mathematically verifies whether the
+agents are actually debating (high dissimilarity/information gain) or just falling into a
+repetitive agreement loop.
+●​ Self-Preference Bias (SPB) Quantification: Create equal-quality pairs of responses
+and measure the directional evaluative deviation to specifically track how often your
+Judge defaults to its own stylistic baseline.
+●​ Zero-Shot Stance Detection Accuracy: Measure how effectively the Judge can
+synthesize the debate process and correctly identify the final legal stance compared to
+strong zero-shot baselines.
+
+●​ Structural Fidelity / Parsing Success Rate: Since you are relying on zero-shot ReAct,
+track the exact percentage of turns where the models successfully output valid, parsable
+tool-calling syntax without breaking character.
+
+

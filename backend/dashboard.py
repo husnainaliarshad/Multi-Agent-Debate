@@ -14,7 +14,7 @@ st.set_page_config(
 # API base URL
 API_BASE = "http://localhost:8000"
 
-def display_event(event: Dict[str, Any]):
+def display_event(event: Dict[str, Any], event_index: int = 0):
     """Display a single event with appropriate styling."""
     event_type = event["event_type"]
     data = event["data"]
@@ -22,7 +22,7 @@ def display_event(event: Dict[str, Any]):
     if event_type == "DEBATE_START":
         st.info(f"🚀 **Debate Started:** {data.get('topic', '')}")
     elif event_type == "ROUND_START":
-        st.markdown(f"---")
+        st.markdown("---")
         st.info(f"🔄 **Round {data.get('round', 1)}/{data.get('total_rounds', 1)}**")
     elif event_type == "PROPOSER_START":
         proposer_id = data.get("proposer_id", 1)
@@ -79,6 +79,8 @@ if "debate_events" not in st.session_state:
     st.session_state.debate_events = []
 if "debate_result" not in st.session_state:
     st.session_state.debate_result = None
+if "debate_complete" not in st.session_state:
+    st.session_state.debate_complete = False
 
 # Sidebar - Recent Debates
 with st.sidebar:
@@ -120,7 +122,26 @@ col_config, col_debate = st.columns([1, 1])
 
 # LEFT COLUMN: Configuration
 with col_config:
-    st.markdown("## ⚙️ Configuration")
+    st.markdown("## ⚙️ Debate Configuration")
+    
+    # Test button for dummy debate
+    if st.button("🧪 Load Dummy Debate (Test)", key="load_dummy"):
+        try:
+            dummy_response = requests.get(f"{API_BASE}/debate/dummy")
+            if dummy_response.status_code == 200:
+                dummy_data = dummy_response.json()
+                st.session_state.session_id = dummy_data["session_id"]
+                st.session_state.debate_events = dummy_data["events"]
+                st.session_state.debate_result = dummy_data
+                st.session_state.debate_complete = True
+                st.success("✅ Dummy debate loaded!")
+                st.rerun()
+            else:
+                st.error(f"Failed to load dummy debate: {dummy_response.text}")
+        except Exception as e:
+            st.error(f"Error loading dummy debate: {str(e)}")
+    
+    st.markdown("---")
     
     # Fetch available models from LM Studio
     @st.cache_data(ttl=300)  # Cache for 5 minutes
@@ -174,6 +195,20 @@ with col_config:
     st.markdown("### 🌡️ Temperature Settings")
     critic_temp = st.slider("Critic Temperature", 0.0, 1.0, 0.7, 0.1)
     judge_temp = st.slider("Judge Temperature", 0.0, 1.0, 0.5, 0.1)
+    
+    # Judge profile selection
+    st.markdown("### 👨‍⚖️ Judge Profile")
+    judge_profile = st.selectbox(
+        "Judge Reasoning Style",
+        ["default", "logical_thinker", "robust_reasoner", "deductive_reasoner"],
+        index=0,
+        help="Select the judge's reasoning approach"
+    )
+    
+    # Evaluation features toggles
+    st.markdown("### 📊 Evaluation Features")
+    use_position_swap = st.checkbox("🔄 Enable Position Swapping (reduce judge bias)", value=True, help="Run judge evaluation twice with swapped argument order")
+    use_info_gain = st.checkbox("📈 Enable Information Gain Metric", value=True, help="Track cosine dissimilarity between consecutive responses")
     
     # Max tokens for speed control
     st.markdown("### ⚡ Performance Settings")
@@ -266,6 +301,9 @@ with col_config:
                         "judge_temperature": judge_temp,
                         "critic_prompt": critic_prompt,
                         "judge_prompt": judge_prompt,
+                        "judge_profile": judge_profile,
+                        "use_position_swap": use_position_swap,
+                        "use_info_gain": use_info_gain,
                         "max_rounds": max_rounds,
                         "max_tokens": max_tokens,
                         "use_search": use_search
@@ -295,17 +333,17 @@ with col_debate:
     st.markdown("## 📡 Debate Output")
     
     # Poll debate events
-    if st.session_state.session_id and not st.session_state.debate_result:
+    if st.session_state.session_id and not st.session_state.debate_result and not st.session_state.debate_complete:
         st.markdown("### Real-time Debate Log")
         
-        # Create placeholder for events
-        event_placeholder = st.empty()
+        # Create a container for events
+        events_container = st.container()
         
         # Poll for events
         max_polls = 100  # Prevent infinite polling
         poll_count = 0
         
-        while poll_count < max_polls and not st.session_state.debate_result:
+        while poll_count < max_polls and not st.session_state.debate_result and not st.session_state.debate_complete:
             try:
                 response = requests.get(f"{API_BASE}/debate/events/{st.session_state.session_id}")
                 
@@ -314,13 +352,13 @@ with col_debate:
                     events = data.get("events", [])
                     is_complete = data.get("complete", False)
                     
-                    # Update events
+                    # Display only new events
                     if len(events) > len(st.session_state.debate_events):
+                        new_events = events[len(st.session_state.debate_events):]
                         st.session_state.debate_events = events
-                    
-                    # Display current events
-                    with event_placeholder.container():
-                        for event in st.session_state.debate_events:
+                        
+                        # Display new events
+                        for event in new_events:
                             display_event(event)
                     
                     # Check if complete
@@ -329,8 +367,11 @@ with col_debate:
                         result_response = requests.get(f"{API_BASE}/debate/result/{st.session_state.session_id}")
                         if result_response.status_code == 200:
                             st.session_state.debate_result = result_response.json()
+                            st.session_state.debate_complete = True
                             st.success("🎉 Debate Complete!")
                             st.rerun()
+                        else:
+                            st.error(f"Failed to fetch result: {result_response.text}")
                         break
                     
                     poll_count += 1
@@ -345,6 +386,33 @@ with col_debate:
     # Display final results
     if st.session_state.debate_result:
         st.markdown("### 🏁 Final Results")
+        
+        # Save button
+        if st.button("💾 Save Debate to Database", key="save_debate"):
+            try:
+                # Get topic from events
+                topic = "Unknown Topic"
+                for event in st.session_state.debate_events:
+                    if event["event_type"] == "DEBATE_START":
+                        topic = event["data"].get("topic", "Unknown Topic")
+                        break
+                
+                save_response = requests.post(
+                    f"{API_BASE}/debate/save",
+                    json={
+                        "session_id": st.session_state.session_id,
+                        "topic": topic,
+                        "events": st.session_state.debate_events,
+                        "result": st.session_state.debate_result
+                    }
+                )
+                
+                if save_response.status_code == 200:
+                    st.success("✅ Debate saved successfully!")
+                else:
+                    st.error(f"Failed to save debate: {save_response.text}")
+            except Exception as e:
+                st.error(f"Error saving debate: {str(e)}")
         
         # Verdict and consensus score
         col1, col2, col3, col4 = st.columns(4)

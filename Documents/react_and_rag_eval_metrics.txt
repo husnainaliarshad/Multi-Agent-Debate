@@ -1,0 +1,34 @@
+1. Evaluating Active RAG (Dynamic Retrieval) Active RAG requires the model to decide when
+and what to retrieve. You should evaluate both the efficiency of these decisions and the quality
+of the retrieved context:
+●​ Search Efficiency (Over-search vs. Under-search): Evaluate the necessity of the
+agent's search decisions by tracking the "over-search" rate (retrieving information the
+model already knows) and the "under-search" rate (failing to trigger a search when
+missing critical facts).
+●​ Gain Beyond RAG (GBR): To measure the actual utility of the active retrieval, calculate
+the GBR. This metric quantifies the improvement in the agent's generation accuracy
+when using the dynamically retrieved context compared to a standard, naive RAG
+baseline.
+●​ Turn-Level Contextual Metrics: Because the debate spans multiple rounds, assess the
+retrieval quality at each step using Turn Contextual Precision (ensuring retrieved
+documents are highly relevant) and Turn Contextual Recall (ensuring all necessary
+information was gathered).
+2. Evaluating ReAct (Reasoning and Tool Use) The ReAct framework forces models to output
+specific thought and action structures. Evaluation must focus on syntactic adherence and logical
+progression:
+●​ Format Adherence and JSON Correctness: Measure whether the agent's outputs
+strictly conform to the required JSON schema or syntax needed to execute the tool, as
+structural failures will crash the debate loop.
+●​ Tool Correctness and Task Completion: Determine whether the agent successfully
+selected the correct tool for the specific sub-task and if the tool execution led to
+meaningful progress toward resolving the debate.
+●​ Trajectory Parsing: Instead of just evaluating the final output, decompose the agent's
+ReAct trajectory into discrete, parsable steps to evaluate the intermediate logical
+consistency of its "Thought-Action-Observation" chain.
+3. Evaluating the Integrated Debate Dynamics Finally, you must evaluate how well the ReAct
+and Active RAG mechanisms serve the overall debate between the Proposer, Critic, and Judge:
+●​ Turn Faithfulness: Measure what proportion of the arguments presented in each
+debate round are strictly grounded in the actively retrieved context, ensuring that the
+agents are not hallucinating facts to win the argument.
+
+

@@ -8,9 +8,9 @@ import time
 import json
 import uuid
 import os
-from database import save_debate_session
 from tools import search_tool
 from config import AgentConfig, DebateConfig, DEFAULT_PROPOSER_PROMPT, DEFAULT_CRITIC_PROMPT, DEFAULT_JUDGE_PROMPT
+from evaluation import DebateMetrics
 
 
 class DebateState(TypedDict):
@@ -186,11 +186,13 @@ class JudgeAgent(DebateAgent):
 class DebateOrchestrator:
     """Orchestrates the multi-agent debate."""
     
-    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False):
+    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False, use_position_swap: bool = True, use_info_gain: bool = True):
         self.config = config
         self.max_tokens = max_tokens
         self.num_rounds = num_rounds
         self.use_search = use_search
+        self.use_position_swap = use_position_swap
+        self.use_info_gain = use_info_gain
         
         # Fresh model initialization for each agent to flush context
         if proposer_configs:
@@ -208,15 +210,11 @@ class DebateOrchestrator:
         self.judge.set_event_callback(self._emit_event)
         self.session_id = str(uuid.uuid4())
         self.events = []
+        
+        # Initialize evaluation metrics
+        self.metrics = DebateMetrics()
 
 
-    def _save_session(self, topic: str):
-        """Persist events to database."""
-        try:
-            # We also include results if the debate is complete
-            save_debate_session(self.session_id, topic, self.events)
-        except Exception as e:
-            print(f"Error saving session to DB: {e}")
 
     def _emit_event(self, event_type: str, data: Dict[str, Any], topic: str = None):
         """Emit an event for streaming."""
@@ -226,20 +224,6 @@ class DebateOrchestrator:
             "timestamp": time.time()
         }
         self.events.append(event)
-        
-        # Use provided topic or find it from state
-        if not topic:
-            if event_type == "DEBATE_START":
-                topic = data.get("topic", "Unknown Topic")
-            elif self.events:
-                # Try to find topic from the first event
-                first_event = self.events[0]
-                if first_event["event_type"] == "DEBATE_START":
-                    topic = first_event["data"].get("topic", "Unknown Topic")
-        
-        # Ensure we have a topic before saving
-        current_topic = topic or "Unknown Topic"
-        self._save_session(current_topic)
 
     def run_debate(self, topic: str):
         """Run the complete debate workflow with multiple proposers and rounds."""
@@ -290,6 +274,9 @@ class DebateOrchestrator:
                         "latency": result["latency"],
                         "syntactic_valid": result["syntactic_valid"]
                     })
+                    # Track metrics if enabled
+                    if self.use_info_gain:
+                        self.metrics.add_proposer_response(result["content"])
                     print(f"[{self.session_id}] Proposer {i+1} complete")
                 
                 all_proposer_arguments.append([r["content"] for r in round_proposer_results])
@@ -309,6 +296,9 @@ class DebateOrchestrator:
                     "latency": critic_result["latency"],
                     "syntactic_valid": critic_result["syntactic_valid"]
                 })
+                # Track metrics if enabled
+                if self.use_info_gain:
+                    self.metrics.add_critic_response(critic_result["content"])
                 print(f"[{self.session_id}] Critic complete")
             
             # Judge synthesizes all arguments and critiques
@@ -322,18 +312,67 @@ class DebateOrchestrator:
                     debate_summary += f"\nProposer {i+1}:\n{arg}\n"
                 debate_summary += f"\nCritic:\n{critique}\n"
             
-            self._emit_event("JUDGE_THOUGHT", {"thought": "Synthesizing all arguments and critiques from all rounds..."})
-            judge_result = self.judge.judge(debate_summary, "")
-            self._emit_event("JUDGE_FINAL", {
-                "response": judge_result["content"],
-                "latency": judge_result["latency"],
-                "syntactic_valid": judge_result["syntactic_valid"]
-            })
-            print(f"[{self.session_id}] Judge complete")
-            
-            # Extract consensus score from judge response
-            consensus_score = self._extract_consensus_score(judge_result["content"])
-            verdict = self._extract_verdict(judge_result["content"])
+            # Position Swapping: Run judge twice with swapped argument order if enabled
+            if self.use_position_swap:
+                self._emit_event("JUDGE_THOUGHT", {"thought": "Running position-swapped evaluation to reduce bias..."})
+                
+                # First run: normal order (Proposer then Critic)
+                judge_result_normal = self.judge.judge(debate_summary, "")
+                consensus_normal = self._extract_consensus_score(judge_result_normal["content"])
+                verdict_normal = self._extract_verdict(judge_result_normal["content"])
+                
+                # Second run: swapped order (Critic then Proposer)
+                debate_summary_swapped = ""
+                for round_num, (args, critique) in enumerate(zip(all_proposer_arguments, all_critic_critiques), 1):
+                    debate_summary_swapped += f"\n=== Round {round_num} ===\n"
+                    debate_summary_swapped += f"\nCritic:\n{critique}\n"
+                    for i, arg in enumerate(args):
+                        debate_summary_swapped += f"\nProposer {i+1}:\n{arg}\n"
+                
+                judge_result_swapped = self.judge.judge(debate_summary_swapped, "")
+                consensus_swapped = self._extract_consensus_score(judge_result_swapped["content"])
+                verdict_swapped = self._extract_verdict(judge_result_swapped["content"])
+                
+                # Average the scores
+                consensus_score = int((consensus_normal + consensus_swapped) / 2)
+                
+                # Use the verdict from the normal run (or could implement voting logic)
+                verdict = verdict_normal
+                
+                # Store position swap scores in metrics
+                if self.use_info_gain:
+                    self.metrics.position_swap_scores.append({
+                        "normal": {"consensus": consensus_normal, "verdict": verdict_normal},
+                        "swapped": {"consensus": consensus_swapped, "verdict": verdict_swapped},
+                        "averaged": {"consensus": consensus_score, "verdict": verdict}
+                    })
+                
+                self._emit_event("JUDGE_FINAL", {
+                    "response": judge_result_normal["content"],
+                    "latency": judge_result_normal["latency"],
+                    "syntactic_valid": judge_result_normal["syntactic_valid"],
+                    "position_swap": {
+                        "normal_consensus": consensus_normal,
+                        "swapped_consensus": consensus_swapped,
+                        "averaged_consensus": consensus_score
+                    }
+                })
+                print(f"[{self.session_id}] Judge complete (Position Swap: {consensus_normal} -> {consensus_swapped} -> {consensus_score})")
+            else:
+                # Normal single-run evaluation
+                self._emit_event("JUDGE_THOUGHT", {"thought": "Synthesizing all arguments and critiques from all rounds..."})
+                judge_result_normal = self.judge.judge(debate_summary, "")
+                consensus_normal = self._extract_consensus_score(judge_result_normal["content"])
+                verdict_normal = self._extract_verdict(judge_result_normal["content"])
+                consensus_score = consensus_normal
+                verdict = verdict_normal
+                
+                self._emit_event("JUDGE_FINAL", {
+                    "response": judge_result_normal["content"],
+                    "latency": judge_result_normal["latency"],
+                    "syntactic_valid": judge_result_normal["syntactic_valid"]
+                })
+                print(f"[{self.session_id}] Judge complete (Single run: {consensus_score})")
             
             self._emit_event("DEBATE_COMPLETE", {
                 "consensus_score": consensus_score,
@@ -343,17 +382,23 @@ class DebateOrchestrator:
             })
             print(f"[{self.session_id}] Debate complete")
             
-            return {
+            result = {
                 "session_id": self.session_id,
                 "proposer_responses": all_proposer_arguments,
                 "critic_responses": all_critic_critiques,
-                "judge_response": judge_result["content"],
+                "judge_response": judge_result_normal["content"],
                 "consensus_score": consensus_score,
                 "verdict": verdict,
                 "num_proposers": len(self.proposers),
                 "num_rounds": self.num_rounds,
                 "events": self.events
             }
+            
+            # Only include metrics if information gain tracking is enabled
+            if self.use_info_gain:
+                result["metrics"] = self.metrics.to_dict()
+            
+            return result
         except Exception as e:
             print(f"[{self.session_id}] Error in run_debate: {str(e)}")
             import traceback

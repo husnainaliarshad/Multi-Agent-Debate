@@ -11,3 +11,5 @@ langchain-community
 ddgs
 psycopg2-binary
 sqlalchemy
+sentence-transformers
+scikit-learn

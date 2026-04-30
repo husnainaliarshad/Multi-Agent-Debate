@@ -6,8 +6,9 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
-# Load environment variables
-DATABASE_URL = "sqlite:///./debate_app.db"
+# Get the directory of this file
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'debate_app.db')}"
 
 Base = declarative_base()
 

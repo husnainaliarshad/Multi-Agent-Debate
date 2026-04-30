@@ -1,4 +1,4 @@
 @echo off
 cd backend
 call venv\Scripts\activate
-python main.py
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
