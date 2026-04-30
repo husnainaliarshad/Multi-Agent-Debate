@@ -6,6 +6,7 @@ import json
 import requests
 from config import DebateConfig, AgentConfig, Settings
 from agents import DebateOrchestrator
+from database import init_db, get_debate_events, get_recent_debates, delete_debate_session
 from dotenv import load_dotenv
 import os
 import threading
@@ -15,6 +16,7 @@ load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(title="Multi-Agent Debate API")
+init_db()
 
 # Enable CORS
 app.add_middleware(
@@ -47,6 +49,7 @@ class DebateInitRequest(BaseModel):
     judge_prompt: Optional[str] = None
     max_rounds: Optional[int] = 1
     max_tokens: Optional[int] = 500
+    use_search: Optional[bool] = True
 
 class DebateInitResponse(BaseModel):
     session_id: str
@@ -94,7 +97,8 @@ def init_debate(request: DebateInitRequest):
             config,
             max_tokens=request.max_tokens or 500,
             proposer_configs=proposer_configs,
-            num_rounds=request.max_rounds or 1
+            num_rounds=request.max_rounds or 1,
+            use_search=request.use_search or False
         )
         session_id = orchestrator.session_id
         
@@ -123,25 +127,57 @@ def run_debate_background(orchestrator: DebateOrchestrator, topic: str):
         }
 
 @app.get("/debate/events/{session_id}")
-def get_debate_events(session_id: str):
+def get_debate_events_endpoint(session_id: str):
     """Get all events for a debate session."""
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+    if session_id in sessions:
+        orchestrator = sessions[session_id]
+        events = orchestrator.events
+    else:
+        # Try loading from database
+        events = get_debate_events(session_id)
+        if not events:
+            raise HTTPException(status_code=404, detail="Session not found")
     
-    orchestrator = sessions[session_id]
     return {
         "session_id": session_id,
-        "events": orchestrator.events,
+        "events": events,
         "complete": session_id in session_results
     }
 
 @app.get("/debate/result/{session_id}")
-def get_debate_result(session_id: str):
-    """Get the final result of a debate."""
+def get_debate_result(session_id: str, wait_seconds: int = 5):
+    """Get the final result of a debate with optional waiting."""
+    import time
+    start_time = time.time()
+    
+    while session_id not in session_results and (time.time() - start_time) < wait_seconds:
+        time.sleep(1)
+        
     if session_id not in session_results:
+        # Last attempt to load from persistence if it's an old session
+        pass # We'll implement results persistence if needed, but for now events are enough
         raise HTTPException(status_code=404, detail="Result not available yet")
     
     return session_results[session_id]
+
+@app.delete("/debate/{session_id}")
+def delete_debate_endpoint(session_id: str):
+    """Delete a debate session from the database."""
+    try:
+        delete_debate_session(session_id)
+        return {"message": "Session deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete session: {str(e)}")
+
+@app.get("/debates/recent")
+def get_recent_debates_endpoint():
+    """List recent debate sessions from database."""
+    try:
+        recent = get_recent_debates(limit=10)
+        return {"sessions": recent}
+    except Exception as e:
+        print(f"Error fetching recent debates: {e}")
+        return {"sessions": []}
 
 @app.get("/models")
 def get_available_models():

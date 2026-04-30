@@ -6,3 +6,8 @@ streamlit
 pydantic
 pydantic-settings
 python-dotenv
+duckduckgo-search
+langchain-community
+ddgs
+psycopg2-binary
+sqlalchemy

@@ -56,7 +56,7 @@ DEFAULT_JUDGE_PROMPT = """You are a Judge in a structured debate. Your role is t
 Your response must include:
 1. A summary of the key arguments from both sides
 2. A final Verdict (which side presented the stronger case)
-3. A Consensus Score from 1-10 (where 10 indicates strong agreement/consensus)
+3. A Consensus Score from 0-100 (where 100 indicates strong agreement/consensus)
 4. Brief justification for your verdict
 
 Be objective and evidence-based in your judgment."""

@@ -19,7 +19,9 @@ def display_event(event: Dict[str, Any]):
     event_type = event["event_type"]
     data = event["data"]
     
-    if event_type == "ROUND_START":
+    if event_type == "DEBATE_START":
+        st.info(f"🚀 **Debate Started:** {data.get('topic', '')}")
+    elif event_type == "ROUND_START":
         st.markdown(f"---")
         st.info(f"🔄 **Round {data.get('round', 1)}/{data.get('total_rounds', 1)}**")
     elif event_type == "PROPOSER_START":
@@ -36,6 +38,14 @@ def display_event(event: Dict[str, Any]):
         st.success(f"✅ Proposer {proposer_id}'s argument complete (Round {round_num})")
         with st.expander(f"View Proposer {proposer_id}'s Response"):
             st.markdown(data.get("response", ""))
+    elif event_type == "SEARCH_START":
+        proposer_id = data.get("proposer_id", 1)
+        st.warning(f"🔍 Proposer {proposer_id} is searching the web for evidence on: {data.get('topic', '')}...")
+    elif event_type == "SEARCH_COMPLETE":
+        proposer_id = data.get("proposer_id", 1)
+        st.info(f"✅ Proposer {proposer_id} found relevant evidence.")
+        with st.expander(f"View Search Results (Proposer {proposer_id})"):
+            st.text(data.get("results", ""))
     elif event_type == "CRITIC_START":
         round_num = data.get("round", 1)
         st.info(f"🔍 Critic is analyzing arguments (Round {round_num})...")
@@ -69,6 +79,38 @@ if "debate_events" not in st.session_state:
     st.session_state.debate_events = []
 if "debate_result" not in st.session_state:
     st.session_state.debate_result = None
+
+# Sidebar - Recent Debates
+with st.sidebar:
+    st.markdown("### 📜 Recent Debates")
+    if st.button("🔄 Refresh History"):
+        st.rerun()
+        
+    try:
+        recent_resp = requests.get(f"{API_BASE}/debates/recent", timeout=2)
+        if recent_resp.status_code == 200:
+            recent_debates = recent_resp.json().get("sessions", [])
+            if not recent_debates:
+                st.write("No recent debates found.")
+            for rd in recent_debates:
+                btn_label = f"{rd['topic'][:50]}..." if len(rd['topic']) > 50 else rd['topic']
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    if st.button(btn_label, key=f"hist_btn_{rd['session_id']}", help=rd['topic']):
+                        st.session_state.session_id = rd['session_id']
+                        st.session_state.debate_events = []
+                        st.session_state.debate_result = None
+                        st.rerun()
+                with col2:
+                    if st.button("🗑️", key=f"del_{rd['session_id']}", help="Delete this debate"):
+                        delete_resp = requests.delete(f"{API_BASE}/debate/{rd['session_id']}")
+                        if delete_resp.status_code == 200:
+                            st.success("Deleted!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete")
+    except Exception as e:
+        st.write("Could not load recent debates.")
 
 # Main title
 st.title("⚖️ Multi-Agent Debate Research Platform")
@@ -141,6 +183,7 @@ with col_config:
     st.markdown("### 🔄 Debate Structure")
     num_proposers = st.slider("Number of Proposers", 1, 5, 1, 1)
     max_rounds = st.slider("Number of Rounds", 1, 5, 1, 1)
+    use_search = st.checkbox("🔍 Enable Internet Search (DuckDuckGo)", value=True, help="Allow proposers to search for evidence online")
     
     # System prompts
     st.markdown("### 📝 System Prompts")
@@ -224,7 +267,8 @@ with col_config:
                         "critic_prompt": critic_prompt,
                         "judge_prompt": judge_prompt,
                         "max_rounds": max_rounds,
-                        "max_tokens": max_tokens
+                        "max_tokens": max_tokens,
+                        "use_search": use_search
                     }
                 )
                 

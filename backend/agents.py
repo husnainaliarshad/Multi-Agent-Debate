@@ -7,6 +7,9 @@ from typing import Literal, Dict, Any
 import time
 import json
 import uuid
+import os
+from database import save_debate_session
+from tools import search_tool
 from config import AgentConfig, DebateConfig, DEFAULT_PROPOSER_PROMPT, DEFAULT_CRITIC_PROMPT, DEFAULT_JUDGE_PROMPT
 
 
@@ -39,12 +42,10 @@ class DebateAgent:
         self.debate_config = debate_config
         self.role = role
         self.max_tokens = max_tokens
+        self.event_callback = None
         
         # Merge max_tokens with any other model_kwargs from environment or config
         model_kwargs = {"max_tokens": max_tokens}
-        # You can add more defaults here if needed, like n_ctx
-        if os.getenv("MODEL_N_CTX"):
-            model_kwargs["n_ctx"] = int(os.getenv("MODEL_N_CTX"))
             
         self.model = init_chat_model(
             config.model,
@@ -54,6 +55,15 @@ class DebateAgent:
             temperature=config.temperature,
             model_kwargs=model_kwargs
         )
+    
+    def set_event_callback(self, callback):
+        """Set a callback for emitting events."""
+        self.event_callback = callback
+
+    def _emit_event(self, event_type: str, data: Dict[str, Any]):
+        """Emit an event via the callback."""
+        if self.event_callback:
+            self.event_callback(event_type, data)
     
     def _get_system_prompt(self, base_prompt: str) -> str:
         """Add token limit instructions to system prompt."""
@@ -105,26 +115,58 @@ class DebateAgent:
 class ProposerAgent(DebateAgent):
     """Proposer agent that generates the initial argument."""
     
-    def __init__(self, config: AgentConfig, debate_config: DebateConfig, max_tokens: int = 500):
+    def __init__(self, config: AgentConfig, debate_config: DebateConfig, max_tokens: int = 500, use_search: bool = False):
         super().__init__(config, debate_config, "proposer", max_tokens)
         self.system_prompt = config.system_prompt or DEFAULT_PROPOSER_PROMPT
+        self.use_search = use_search
     
-    def generate_argument(self, topic: str) -> Dict[str, Any]:
+    def generate_argument(self, topic: str, round_num: int = 1, proposer_id: int = 1) -> Dict[str, Any]:
         """Generate the initial argument on the topic."""
-        prompt = f"Topic: {topic}\n\nGenerate your argument."
+        search_results = ""
+        if self.use_search and round_num == 1:
+            print(f"[{self.role}] Searching for evidence on: {topic}")
+            # Emit event for tool use visibility
+            self._emit_event("SEARCH_START", {"proposer_id": proposer_id, "topic": topic})
+            
+            # Improved query for better results
+            search_query = f"{topic} facts evidence scientific consensus"
+            search_results = search_tool.run(search_query)
+            
+            self._emit_event("SEARCH_COMPLETE", {"proposer_id": proposer_id, "results": search_results})
+            print(f"[{self.role}] Search results obtained: {len(search_results)} chars")
+        
+        prompt = f"Topic: {topic}\n\n"
+        if search_results:
+            prompt += f"Background Information/Search Results:\n{search_results}\n\n"
+            prompt += "CRITICAL: You MUST incorporate the facts and evidence from the search results above into your argument. Cite specific details.\n\n"
+        
+        prompt += "Generate your argument."
         return self.invoke(prompt, self.system_prompt)
 
 
 class CriticAgent(DebateAgent):
     """Critic agent that identifies fallacies in the proposer's argument."""
     
-    def __init__(self, config: AgentConfig, debate_config: DebateConfig, max_tokens: int = 500):
+    def __init__(self, config: AgentConfig, debate_config: DebateConfig, max_tokens: int = 500, use_search: bool = False):
         super().__init__(config, debate_config, "critic", max_tokens)
         self.system_prompt = config.system_prompt or DEFAULT_CRITIC_PROMPT
+        self.use_search = use_search
     
-    def critique(self, proposer_argument: str) -> Dict[str, Any]:
+    def critique(self, proposer_argument: str, topic: str = "", round_num: int = 1) -> Dict[str, Any]:
         """Critique the proposer's argument."""
-        prompt = f"Proposer's Argument:\n{proposer_argument}\n\nProvide your critique."
+        search_results = ""
+        if self.use_search:
+            search_query = f"counter arguments and critiques for: {topic}"
+            self._emit_event("SEARCH_START", {"role": "critic", "topic": topic, "query": search_query})
+            search_results = search_tool.run(search_query)
+            self._emit_event("SEARCH_COMPLETE", {"role": "critic", "results": search_results})
+
+        prompt = ""
+        if search_results:
+            prompt += f"Background Research on Counter-Arguments:\n{search_results}\n\n"
+            prompt += "Use the research above to find specific weaknesses or overlooked facts.\n\n"
+            
+        prompt += f"Proposer's Argument:\n{proposer_argument}\n\nProvide your critique."
         return self.invoke(prompt, self.system_prompt)
 
 
@@ -144,26 +186,68 @@ class JudgeAgent(DebateAgent):
 class DebateOrchestrator:
     """Orchestrates the multi-agent debate."""
     
-    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1):
+    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False):
         self.config = config
         self.max_tokens = max_tokens
         self.num_rounds = num_rounds
+        self.use_search = use_search
         
         # Fresh model initialization for each agent to flush context
         if proposer_configs:
-            self.proposers = [ProposerAgent(cfg, config, max_tokens) for cfg in proposer_configs]
+            self.proposers = [ProposerAgent(cfg, config, max_tokens, use_search=use_search) for cfg in proposer_configs]
         else:
-            self.proposers = [ProposerAgent(config.proposer, config, max_tokens)]
+            self.proposers = [ProposerAgent(config.proposer, config, max_tokens, use_search=use_search)]
         
-        self.critic = CriticAgent(config.critic, config, max_tokens)
+        for p in self.proposers:
+            p.set_event_callback(self._emit_event)
+            
+        self.critic = CriticAgent(config.critic, config, max_tokens, use_search=use_search)
+        self.critic.set_event_callback(self._emit_event)
+        
         self.judge = JudgeAgent(config.judge, config, max_tokens)
+        self.judge.set_event_callback(self._emit_event)
         self.session_id = str(uuid.uuid4())
         self.events = []
-    
+
+
+    def _save_session(self, topic: str):
+        """Persist events to database."""
+        try:
+            # We also include results if the debate is complete
+            save_debate_session(self.session_id, topic, self.events)
+        except Exception as e:
+            print(f"Error saving session to DB: {e}")
+
+    def _emit_event(self, event_type: str, data: Dict[str, Any], topic: str = None):
+        """Emit an event for streaming."""
+        event = {
+            "event_type": event_type,
+            "data": data,
+            "timestamp": time.time()
+        }
+        self.events.append(event)
+        
+        # Use provided topic or find it from state
+        if not topic:
+            if event_type == "DEBATE_START":
+                topic = data.get("topic", "Unknown Topic")
+            elif self.events:
+                # Try to find topic from the first event
+                first_event = self.events[0]
+                if first_event["event_type"] == "DEBATE_START":
+                    topic = first_event["data"].get("topic", "Unknown Topic")
+        
+        # Ensure we have a topic before saving
+        current_topic = topic or "Unknown Topic"
+        self._save_session(current_topic)
+
     def run_debate(self, topic: str):
         """Run the complete debate workflow with multiple proposers and rounds."""
         try:
             print(f"[{self.session_id}] Starting debate on topic: {topic}")
+            # Emit first event with topic immediately for persistence visibility
+            self._emit_event("DEBATE_START", {"topic": topic})
+            
             print(f"[{self.session_id}] Number of proposers: {len(self.proposers)}, Rounds: {self.num_rounds}")
             
             # Store all proposer arguments and critic critiques across rounds
@@ -182,7 +266,7 @@ class DebateOrchestrator:
                     self._emit_event("PROPOSER_THOUGHT", {"proposer_id": i+1, "round": round_num, "thought": "Analyzing topic and constructing argument..."})
                     
                     if round_num == 1:
-                        result = proposer.generate_argument(topic)
+                        result = proposer.generate_argument(topic, round_num=round_num, proposer_id=i+1)
                     else:
                         # In later rounds, respond to previous critique and don't repeat yourself
                         previous_critique = "\n\n".join(all_critic_critiques[round_num-2])
@@ -193,7 +277,9 @@ class DebateOrchestrator:
                             f"Critic's Critique:\n{previous_critique}\n\n"
                             f"IMPORTANT: Do not repeat your previous points. Respond to the critique, "
                             f"address the weaknesses identified, and provide new supporting evidence or "
-                            f"refined reasoning. Build upon your previous argument rather than restating it."
+                            f"refined reasoning. Build upon your previous argument rather than restating it.",
+                            round_num=round_num,
+                            proposer_id=i+1
                         )
                     
                     round_proposer_results.append(result)
@@ -209,14 +295,14 @@ class DebateOrchestrator:
                 all_proposer_arguments.append([r["content"] for r in round_proposer_results])
                 
                 # Critic critiques all proposer arguments
-                print(f"[{self.session_id}] Critic analyzing {len(round_proposer_results)} arguments...")
+                print(f"[{self.session_id}] Critic analyzing...")
                 self._emit_event("CRITIC_START", {"round": round_num})
-                self._emit_event("CRITIC_THOUGHT", {"round": round_num, "thought": f"Analyzing {len(round_proposer_results)} proposer arguments for fallacies..."})
+                self._emit_event("CRITIC_THOUGHT", {"round": round_num, "thought": "Identifying weaknesses and fallacies..."})
                 
-                combined_arguments = "\n\n---\n\n".join([f"Proposer {i+1}:\n{r['content']}" for i, r in enumerate(round_proposer_results)])
-                critic_result = self.critic.critique(combined_arguments)
+                combined_args = "\n\n".join([f"Proposer {idx+1}: {arg}" for idx, arg in enumerate(round_proposer_results)])
+                critic_result = self.critic.critique(combined_args, topic=topic, round_num=round_num)
                 
-                all_critic_critiques.append(critic_result["content"])
+                all_critic_critiques.append([critic_result["content"]])
                 self._emit_event("CRITIC_FINAL", {
                     "round": round_num,
                     "response": critic_result["content"],
@@ -290,8 +376,8 @@ class DebateOrchestrator:
         match = re.search(r'consensus.*?(\d+)', judge_response, re.IGNORECASE)
         if match:
             score = int(match.group(1))
-            return min(max(score, 1), 10)
-        return 5  # Default middle score
+            return min(max(score, 0), 100)
+        return 50  # Default middle score
     
     def _extract_verdict(self, judge_response: str) -> str:
         """Extract verdict from judge response."""
