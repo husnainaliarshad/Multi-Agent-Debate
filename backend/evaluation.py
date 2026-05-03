@@ -4,6 +4,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from typing import List, Dict, Any
+import re
 
 # Load embedding model (lazy load)
 _embedding_model = None
@@ -57,6 +58,36 @@ def detect_repetitive_loop(responses: List[str], threshold: float = 0.2) -> bool
     avg_dissimilarity = np.mean(dissimilarities)
     return avg_dissimilarity < threshold
 
+def calculate_turn_faithfulness(argument: str, search_results: str, threshold: float = 0.5) -> float:
+    """
+    Calculate the percentage of argument sentences that are grounded in search results.
+    """
+    if not search_results or not argument:
+        return 0.0
+        
+    model = get_embedding_model()
+    
+    # Simple sentence splitting
+    arg_sentences = [s.strip() for s in re.split(r'[.!?]+', argument) if len(s.strip()) > 10]
+    search_sentences = [s.strip() for s in re.split(r'[.!?]+', search_results) if len(s.strip()) > 10]
+    
+    if not arg_sentences or not search_sentences:
+        return 0.0
+        
+    arg_embs = model.encode(arg_sentences)
+    search_embs = model.encode(search_sentences)
+    
+    # Calculate similarity matrix
+    sim_matrix = cosine_similarity(arg_embs, search_embs)
+    
+    # For each argument sentence, find max similarity with any search sentence
+    max_sims = np.max(sim_matrix, axis=1)
+    
+    # Count how many sentences are above threshold
+    faithful_count = np.sum(max_sims >= threshold)
+    
+    return float(faithful_count / len(arg_sentences))
+
 class DebateMetrics:
     """Track and calculate debate evaluation metrics."""
     
@@ -66,6 +97,8 @@ class DebateMetrics:
         self.information_gains: List[float] = []
         self.position_swap_scores: List[Dict[str, Any]] = []
         self.turn_faithfulness: List[float] = []
+        self.format_adherence: Dict[str, int] = {"valid": 0, "total": 0}
+        self.search_efficiency: Dict[str, int] = {"total_searches": 0, "redundant_searches": 0, "empty_searches": 0}
     
     def add_proposer_response(self, response: str):
         """Add a proposer response and calculate information gain."""
@@ -110,5 +143,8 @@ class DebateMetrics:
             "num_proposer_responses": len(self.proposer_responses),
             "num_critic_responses": len(self.critic_responses),
             "position_swap_scores": self.position_swap_scores,
-            "turn_faithfulness": [float(x) for x in self.turn_faithfulness]
+            "turn_faithfulness": [float(x) for x in self.turn_faithfulness],
+            "format_adherence": self.format_adherence,
+            "format_adherence_percent": (self.format_adherence["valid"] / self.format_adherence["total"] * 100) if self.format_adherence["total"] > 0 else 0,
+            "search_efficiency": self.search_efficiency
         }

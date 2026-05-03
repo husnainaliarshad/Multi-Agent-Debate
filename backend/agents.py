@@ -10,7 +10,7 @@ import uuid
 import os
 from tools import search_tool
 from config import AgentConfig, DebateConfig, DEFAULT_PROPOSER_PROMPT, DEFAULT_CRITIC_PROMPT, DEFAULT_JUDGE_PROMPT
-from evaluation import DebateMetrics
+from evaluation import DebateMetrics, calculate_turn_faithfulness
 
 
 class DebateState(TypedDict):
@@ -186,13 +186,15 @@ class JudgeAgent(DebateAgent):
 class DebateOrchestrator:
     """Orchestrates the multi-agent debate."""
     
-    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False, use_position_swap: bool = True, use_info_gain: bool = True):
+    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False, use_position_swap: bool = True, use_info_gain: bool = True, use_faithfulness: bool = True, use_summary_relay: bool = True):
         self.config = config
         self.max_tokens = max_tokens
         self.num_rounds = num_rounds
         self.use_search = use_search
         self.use_position_swap = use_position_swap
         self.use_info_gain = use_info_gain
+        self.use_faithfulness = use_faithfulness
+        self.use_summary_relay = use_summary_relay
         
         # Fresh model initialization for each agent to flush context
         if proposer_configs:
@@ -234,9 +236,11 @@ class DebateOrchestrator:
             
             print(f"[{self.session_id}] Number of proposers: {len(self.proposers)}, Rounds: {self.num_rounds}")
             
-            # Store all proposer arguments and critic critiques across rounds
+            # Store all proposer arguments, critic critiques, and search results across rounds
             all_proposer_arguments = []  # List of lists: [[round1_args], [round2_args], ...]
             all_critic_critiques = []     # List of lists: [[round1_critiques], [round2_critiques], ...]
+            all_search_results = []       # List of lists: [[round1_search], [round2_search], ...]
+            self.round_summaries = []     # List of dicts for summary relay
             
             for round_num in range(1, self.num_rounds + 1):
                 print(f"[{self.session_id}] Round {round_num}/{self.num_rounds}")
@@ -244,6 +248,7 @@ class DebateOrchestrator:
                 
                 # All proposers generate arguments in parallel
                 round_proposer_results = []
+                round_search_results = []
                 for i, proposer in enumerate(self.proposers):
                     print(f"[{self.session_id}] Proposer {i+1} generating argument...")
                     self._emit_event("PROPOSER_START", {"proposer_id": i+1, "round": round_num, "topic": topic})
@@ -253,8 +258,13 @@ class DebateOrchestrator:
                         result = proposer.generate_argument(topic, round_num=round_num, proposer_id=i+1)
                     else:
                         # In later rounds, respond to previous critique and don't repeat yourself
-                        previous_critique = "\n\n".join(all_critic_critiques[round_num-2])
-                        previous_argument = all_proposer_arguments[round_num-2][i]
+                        if self.use_summary_relay and round_num > 1 and len(self.round_summaries) >= round_num - 1:
+                            previous_critique = self.round_summaries[round_num-2]['critic']
+                            previous_argument = self.round_summaries[round_num-2]['proposer'][i]
+                        else:
+                            previous_critique = "\n\n".join(all_critic_critiques[round_num-2])
+                            previous_argument = all_proposer_arguments[round_num-2][i]
+                            
                         result = proposer.generate_argument(
                             f"Topic: {topic}\n\n"
                             f"Your Previous Argument:\n{previous_argument}\n\n"
@@ -267,6 +277,29 @@ class DebateOrchestrator:
                         )
                     
                     round_proposer_results.append(result)
+                    
+                    # Capture search results from events for this proposer/round
+                    search_content = ""
+                    for event in reversed(self.events):
+                        if event["event_type"] == "SEARCH_COMPLETE" and \
+                           event["data"].get("proposer_id") == i+1:
+                            search_content = event["data"].get("results", "")
+                            self.metrics.search_efficiency["total_searches"] += 1
+                            if not search_content or len(search_content.strip()) < 20:
+                                self.metrics.search_efficiency["empty_searches"] += 1
+                            break
+                    round_search_results.append(search_content)
+                    
+                    # Track Faithfulness
+                    if self.use_faithfulness and search_content:
+                        faithfulness_score = calculate_turn_faithfulness(result["content"], search_content)
+                        self.metrics.turn_faithfulness.append(faithfulness_score)
+
+                    # Track Format Adherence
+                    self.metrics.format_adherence["total"] += 1
+                    if result.get("syntactic_valid", False):
+                        self.metrics.format_adherence["valid"] += 1
+
                     self._emit_event("PROPOSER_FINAL", {
                         "proposer_id": i+1,
                         "round": round_num,
@@ -280,14 +313,33 @@ class DebateOrchestrator:
                     print(f"[{self.session_id}] Proposer {i+1} complete")
                 
                 all_proposer_arguments.append([r["content"] for r in round_proposer_results])
+                all_search_results.append(round_search_results)
                 
                 # Critic critiques all proposer arguments
                 print(f"[{self.session_id}] Critic analyzing...")
                 self._emit_event("CRITIC_START", {"round": round_num})
                 self._emit_event("CRITIC_THOUGHT", {"round": round_num, "thought": "Identifying weaknesses and fallacies..."})
                 
-                combined_args = "\n\n".join([f"Proposer {idx+1}: {arg}" for idx, arg in enumerate(round_proposer_results)])
+                if self.use_summary_relay and round_num > 1 and len(self.round_summaries) >= round_num - 1:
+                    combined_args = "\n\n".join([f"Proposer {idx+1} (Summary): {arg}" for idx, arg in enumerate(self.round_summaries[round_num-2]['proposer'])])
+                else:
+                    combined_args = "\n\n".join([f"Proposer {idx+1}: {arg}" for idx, arg in enumerate(round_proposer_results)])
+                    
                 critic_result = self.critic.critique(combined_args, topic=topic, round_num=round_num)
+                
+                # Format adherence tracking
+                self.metrics.format_adherence["total"] += 1
+                if critic_result.get("syntactic_valid", False):
+                    self.metrics.format_adherence["valid"] += 1
+                    
+                # Track critic search efficiency
+                for event in reversed(self.events):
+                    if event["event_type"] == "SEARCH_COMPLETE" and event["data"].get("role") == "critic":
+                        critic_search = event["data"].get("results", "")
+                        self.metrics.search_efficiency["total_searches"] += 1
+                        if not critic_search or len(critic_search.strip()) < 20:
+                            self.metrics.search_efficiency["empty_searches"] += 1
+                        break
                 
                 all_critic_critiques.append([critic_result["content"]])
                 self._emit_event("CRITIC_FINAL", {
@@ -300,6 +352,21 @@ class DebateOrchestrator:
                 if self.use_info_gain:
                     self.metrics.add_critic_response(critic_result["content"])
                 print(f"[{self.session_id}] Critic complete")
+
+                # Summary-Based Relay
+                if self.use_summary_relay and round_num < self.num_rounds:
+                    print(f"[{self.session_id}] Generating round summaries for relay...")
+                    self._emit_event("JUDGE_THOUGHT", {"thought": f"Summarizing Round {round_num} for relay to next round..."})
+                    
+                    round_summary = {'proposer': [], 'critic': ""}
+                    for idx, arg in enumerate(round_proposer_results):
+                        summ_res = self.judge.invoke(f"Summarize this argument concisely while preserving key claims and evidence:\n\n{arg['content']}", "You are a Summarizer. Output only the condensed summary.")
+                        round_summary['proposer'].append(summ_res['content'])
+                    
+                    crit_summ_res = self.judge.invoke(f"Summarize this critique concisely:\n\n{critic_result['content']}", "You are a Summarizer. Output only the condensed summary.")
+                    round_summary['critic'] = crit_summ_res['content']
+                    
+                    self.round_summaries.append(round_summary)
             
             # Judge synthesizes all arguments and critiques
             print(f"[{self.session_id}] Judge synthesizing debate...")
@@ -386,6 +453,7 @@ class DebateOrchestrator:
                 "session_id": self.session_id,
                 "proposer_responses": all_proposer_arguments,
                 "critic_responses": all_critic_critiques,
+                "search_results": all_search_results,
                 "judge_response": judge_result_normal["content"],
                 "consensus_score": consensus_score,
                 "verdict": verdict,
@@ -394,9 +462,8 @@ class DebateOrchestrator:
                 "events": self.events
             }
             
-            # Only include metrics if information gain tracking is enabled
-            if self.use_info_gain:
-                result["metrics"] = self.metrics.to_dict()
+            # Always include metrics since we now track many aspects
+            result["metrics"] = self.metrics.to_dict()
             
             return result
         except Exception as e:

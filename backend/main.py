@@ -54,6 +54,8 @@ class DebateInitRequest(BaseModel):
     judge_profile: Optional[str] = "default"
     use_position_swap: Optional[bool] = True
     use_info_gain: Optional[bool] = True
+    use_faithfulness: Optional[bool] = True
+    use_summary_relay: Optional[bool] = True
     max_rounds: Optional[int] = 1
     max_tokens: Optional[int] = 500
     use_search: Optional[bool] = True
@@ -112,7 +114,9 @@ def init_debate(request: DebateInitRequest):
             num_rounds=request.max_rounds or 1,
             use_search=request.use_search or False,
             use_position_swap=request.use_position_swap or True,
-            use_info_gain=request.use_info_gain or True
+            use_info_gain=request.use_info_gain or True,
+            use_faithfulness=request.use_faithfulness or True,
+            use_summary_relay=request.use_summary_relay or True
         )
         session_id = orchestrator.session_id
         
@@ -254,8 +258,9 @@ def dummy_debate():
     """Return a dummy debate result for testing the frontend."""
     return {
         "session_id": "dummy_session_123",
-        "proposer_responses": [["This is a dummy proposer argument about the topic."]],
+        "proposer_responses": [["This is a dummy proposer argument about the topic. It incorporates evidence from the search results below."]],
         "critic_responses": [["This is a dummy critic critique of the argument."]],
+        "search_results": [["Based on our search, we found that 95% of legal experts agree that dummy topics are useful for testing."]],
         "judge_response": "This is a dummy judge verdict with a consensus score.",
         "consensus_score": 75,
         "verdict": "Partially valid",
@@ -263,7 +268,8 @@ def dummy_debate():
         "num_rounds": 1,
         "events": [
             {"event_type": "DEBATE_START", "data": {"topic": "Dummy Topic"}, "timestamp": 1234567890},
-            {"event_type": "PROPOSER_FINAL", "data": {"response": "Dummy response"}, "timestamp": 1234567891}
+            {"event_type": "SEARCH_COMPLETE", "data": {"proposer_id": 1, "results": "Based on our search, we found that 95% of legal experts agree that dummy topics are useful for testing."}, "timestamp": 1234567891},
+            {"event_type": "PROPOSER_FINAL", "data": {"response": "Dummy response"}, "timestamp": 1234567892}
         ]
     }
 

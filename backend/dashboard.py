@@ -124,153 +124,128 @@ col_config, col_debate = st.columns([1, 1])
 with col_config:
     st.markdown("## ⚙️ Debate Configuration")
     
-    # Test button for dummy debate
-    if st.button("🧪 Load Dummy Debate (Test)", key="load_dummy"):
-        try:
-            dummy_response = requests.get(f"{API_BASE}/debate/dummy")
-            if dummy_response.status_code == 200:
-                dummy_data = dummy_response.json()
-                st.session_state.session_id = dummy_data["session_id"]
-                st.session_state.debate_events = dummy_data["events"]
-                st.session_state.debate_result = dummy_data
-                st.session_state.debate_complete = True
-                st.success("✅ Dummy debate loaded!")
-                st.rerun()
-            else:
-                st.error(f"Failed to load dummy debate: {dummy_response.text}")
-        except Exception as e:
-            st.error(f"Error loading dummy debate: {str(e)}")
-    
-    st.markdown("---")
-    
-    # Fetch available models from LM Studio
-    @st.cache_data(ttl=300)  # Cache for 5 minutes
-    def get_available_models():
-        """Fetch available models from the backend."""
-        try:
-            response = requests.get(f"{API_BASE}/models", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                if "warning" in data:
-                    st.warning(data["warning"])
-                return data.get("models", ["liquid/lfm2.5-1.2b"])
-            return ["liquid/lfm2.5-1.2b"]
-        except:
-            return ["liquid/lfm2.5-1.2b"]
-    
-    # Model selection
-    st.markdown("### 🤖 Model Selection")
-    
-    # Add refresh button
-    col_refresh, col_label = st.columns([1, 5])
-    with col_refresh:
-        refresh_models = st.button("🔄", help="Refresh models from LM Studio")
-    with col_label:
-        st.write("")
-    
-    # Clear cache and re-fetch if refresh button clicked
-    if refresh_models:
-        st.cache_data.clear()
-        st.rerun()
-    
-    available_models = get_available_models()
-    
-    if len(available_models) > 0:
-        critic_model = st.selectbox(
-            "Critic Model",
-            available_models,
-            index=0
-        )
-        judge_model = st.selectbox(
-            "Judge Model",
-            available_models,
-            index=0
-        )
-    else:
-        st.error("No models available. Check LM Studio connection.")
-        critic_model = "liquid/lfm2.5-1.2b"
-        judge_model = "liquid/lfm2.5-1.2b"
-    
-    # Temperature sliders
-    st.markdown("### 🌡️ Temperature Settings")
-    critic_temp = st.slider("Critic Temperature", 0.0, 1.0, 0.7, 0.1)
-    judge_temp = st.slider("Judge Temperature", 0.0, 1.0, 0.5, 0.1)
-    
-    # Judge profile selection
-    st.markdown("### 👨‍⚖️ Judge Profile")
-    judge_profile = st.selectbox(
-        "Judge Reasoning Style",
-        ["default", "logical_thinker", "robust_reasoner", "deductive_reasoner"],
-        index=0,
-        help="Select the judge's reasoning approach"
-    )
-    
-    # Evaluation features toggles
-    st.markdown("### 📊 Evaluation Features")
-    use_position_swap = st.checkbox("🔄 Enable Position Swapping (reduce judge bias)", value=True, help="Run judge evaluation twice with swapped argument order")
-    use_info_gain = st.checkbox("📈 Enable Information Gain Metric", value=True, help="Track cosine dissimilarity between consecutive responses")
-    
-    # Max tokens for speed control
-    st.markdown("### ⚡ Performance Settings")
-    max_tokens = st.slider("Max Tokens (lower = faster)", 100, 2000, 500, 50)
-    
-    # Debate structure settings
-    st.markdown("### 🔄 Debate Structure")
-    num_proposers = st.slider("Number of Proposers", 1, 5, 1, 1)
-    max_rounds = st.slider("Number of Rounds", 1, 5, 1, 1)
-    use_search = st.checkbox("🔍 Enable Internet Search (DuckDuckGo)", value=True, help="Allow proposers to search for evidence online")
-    
-    # System prompts
-    st.markdown("### 📝 System Prompts")
-    
-    # Proposer configurations (dynamic based on num_proposers)
-    proposer_configs = []
-    for i in range(num_proposers):
-        with st.expander(f"Proposer {i+1} Configuration", expanded=i == 0):
-            proposer_model = st.selectbox(
-                f"Proposer {i+1} Model",
-                available_models,
-                index=0,
-                key=f"proposer_{i}_model"
-            )
-            proposer_temp = st.slider(
-                f"Proposer {i+1} Temperature",
-                0.0, 1.0, 0.7, 0.1,
-                key=f"proposer_{i}_temp"
-            )
-            proposer_prompt = st.text_area(
-                f"Proposer {i+1} System Prompt",
-                value="You are a Proposer in a structured debate. Your role is to generate a well-reasoned legal argument on the given topic.",
-                height=80,
-                key=f"proposer_{i}_prompt"
-            )
-            proposer_configs.append({
-                "model": proposer_model,
-                "temperature": proposer_temp,
-                "system_prompt": proposer_prompt
-            })
-    
-    with st.expander("Critic Prompt", expanded=False):
-        critic_prompt = st.text_area(
-            "Edit Critic System Prompt",
-            value="You are a Critic in a structured debate. Your role is to identify logical fallacies, counter-points, and weaknesses in the Proposer's argument.",
-            height=100
-        )
-    
-    with st.expander("Judge Prompt", expanded=False):
-        judge_prompt = st.text_area(
-            "Edit Judge System Prompt",
-            value="You are a Judge in a structured debate. Your role is to synthesize both the Proposer's and Critic's arguments and provide a balanced verdict.",
-            height=100
-        )
-    
-    # Topic input
+    # Topic input at the very top
     st.markdown("### 💬 Debate Topic")
     topic = st.text_input(
         "Enter a topic for the debate",
         placeholder="e.g., 'Should AI be granted legal personhood?'",
-        value=""
+        value="",
+        label_visibility="collapsed"
     )
+    
+    st.markdown("---")
+    
+    # Organize parameters into Tabs
+    tab_struct, tab_agents, tab_eval, tab_adv = st.tabs([
+        "🏗️ Structure", "🤖 Agents", "📊 Evaluation", "⚙️ Advanced"
+    ])
+    
+    with tab_struct:
+        st.markdown("### 🔄 Debate Structure")
+        num_proposers = st.slider("Number of Proposers", 1, 5, 1, 1)
+        max_rounds = st.slider("Number of Rounds", 1, 5, 1, 1)
+        use_search = st.checkbox("🔍 Enable Internet Search (DuckDuckGo)", value=True, help="Allow proposers to search for evidence online")
+    
+    with tab_agents:
+        # Fetch available models from LM Studio
+        @st.cache_data(ttl=300)  # Cache for 5 minutes
+        def get_available_models():
+            """Fetch available models from the backend."""
+            try:
+                response = requests.get(f"{API_BASE}/models", timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "warning" in data:
+                        st.warning(data["warning"])
+                    return data.get("models", ["liquid/lfm2.5-1.2b"])
+                return ["liquid/lfm2.5-1.2b"]
+            except:
+                return ["liquid/lfm2.5-1.2b"]
+        
+        st.markdown("### 🤖 Model Selection")
+        col_refresh, col_label = st.columns([1, 5])
+        with col_refresh:
+            refresh_models = st.button("🔄", help="Refresh models from LM Studio")
+        with col_label:
+            st.write("")
+        
+        if refresh_models:
+            st.cache_data.clear()
+            st.rerun()
+            
+        available_models = get_available_models()
+        
+        if len(available_models) > 0:
+            critic_model = st.selectbox("Critic Model", available_models, index=0)
+            judge_model = st.selectbox("Judge Model", available_models, index=0)
+        else:
+            st.error("No models available. Check LM Studio connection.")
+            critic_model = "liquid/lfm2.5-1.2b"
+            judge_model = "liquid/lfm2.5-1.2b"
+            
+        st.markdown("### 👨‍⚖️ Judge Profile")
+        judge_profile = st.selectbox(
+            "Judge Reasoning Style",
+            ["default", "logical_thinker", "robust_reasoner", "deductive_reasoner"],
+            index=0,
+            help="Select the judge's reasoning approach"
+        )
+            
+        st.markdown("### 📝 System Prompts")
+        proposer_configs = []
+        for i in range(num_proposers):
+            with st.expander(f"Proposer {i+1} Configuration", expanded=i == 0):
+                proposer_model = st.selectbox(f"Proposer {i+1} Model", available_models, index=0, key=f"proposer_{i}_model")
+                proposer_temp = st.slider(f"Proposer {i+1} Temperature", 0.0, 1.0, 0.7, 0.1, key=f"proposer_{i}_temp")
+                proposer_prompt = st.text_area(
+                    f"Proposer {i+1} System Prompt",
+                    value="You are a Proposer in a structured debate. Your role is to generate a well-reasoned legal argument on the given topic.",
+                    height=80,
+                    key=f"proposer_{i}_prompt"
+                )
+                proposer_configs.append({
+                    "model": proposer_model,
+                    "temperature": proposer_temp,
+                    "system_prompt": proposer_prompt
+                })
+        
+        with st.expander("Critic Prompt", expanded=False):
+            critic_prompt = st.text_area("Edit Critic System Prompt", value="You are a Critic in a structured debate. Your role is to identify logical fallacies, counter-points, and weaknesses in the Proposer's argument.", height=100)
+        
+        with st.expander("Judge Prompt", expanded=False):
+            judge_prompt = st.text_area("Edit Judge System Prompt", value="You are a Judge in a structured debate. Your role is to synthesize both the Proposer's and Critic's arguments and provide a balanced verdict.", height=100)
+            
+    with tab_eval:
+        st.markdown("### 📊 Evaluation Features")
+        use_position_swap = st.checkbox("🔄 Enable Position Swapping (reduce judge bias)", value=True, help="Run judge evaluation twice with swapped argument order")
+        use_info_gain = st.checkbox("📈 Enable Information Gain Metric", value=True, help="Track cosine dissimilarity between consecutive responses")
+        use_faithfulness = st.checkbox("🔎 Enable Turn Faithfulness Metric", value=True, help="Calculate percentage of arguments grounded in search results")
+        use_summary_relay = st.checkbox("📝 Enable Summary-Based Relay", value=True, help="Condense previous rounds into summaries to reduce token bloat")
+        
+    with tab_adv:
+        st.markdown("### 🌡️ Temperature Settings")
+        critic_temp = st.slider("Critic Temperature", 0.0, 1.0, 0.7, 0.1)
+        judge_temp = st.slider("Judge Temperature", 0.0, 1.0, 0.5, 0.1)
+        
+        st.markdown("### ⚡ Performance Settings")
+        max_tokens = st.slider("Max Tokens (lower = faster)", 100, 2000, 500, 50)
+        
+        st.markdown("---")
+        if st.button("🧪 Load Dummy Debate (Test)", key="load_dummy"):
+            try:
+                dummy_response = requests.get(f"{API_BASE}/debate/dummy")
+                if dummy_response.status_code == 200:
+                    dummy_data = dummy_response.json()
+                    st.session_state.session_id = dummy_data["session_id"]
+                    st.session_state.debate_events = dummy_data["events"]
+                    st.session_state.debate_result = dummy_data
+                    st.session_state.debate_complete = True
+                    st.success("✅ Dummy debate loaded!")
+                    st.rerun()
+                else:
+                    st.error(f"Failed to load dummy debate: {dummy_response.text}")
+            except Exception as e:
+                st.error(f"Error loading dummy debate: {str(e)}")
     
     # Initialize debate button
     st.markdown("---")
@@ -304,6 +279,8 @@ with col_config:
                         "judge_profile": judge_profile,
                         "use_position_swap": use_position_swap,
                         "use_info_gain": use_info_gain,
+                        "use_faithfulness": use_faithfulness,
+                        "use_summary_relay": use_summary_relay,
                         "max_rounds": max_rounds,
                         "max_tokens": max_tokens,
                         "use_search": use_search
@@ -336,6 +313,21 @@ with col_debate:
     if st.session_state.session_id and not st.session_state.debate_result and not st.session_state.debate_complete:
         st.markdown("### Real-time Debate Log")
         
+        # Check if already complete first (Optimization)
+        try:
+            status_resp = requests.get(f"{API_BASE}/debate/events/{st.session_state.session_id}", timeout=2)
+            if status_resp.status_code == 200:
+                status_data = status_resp.json()
+                if status_data.get("complete"):
+                    result_response = requests.get(f"{API_BASE}/debate/result/{st.session_state.session_id}")
+                    if result_response.status_code == 200:
+                        st.session_state.debate_result = result_response.json()
+                        st.session_state.debate_complete = True
+                        st.session_state.debate_events = status_data.get("events", [])
+                        st.rerun()
+        except:
+            pass
+
         # Create a container for events
         events_container = st.container()
         
@@ -424,6 +416,37 @@ with col_debate:
             st.metric("Proposers", st.session_state.debate_result.get("num_proposers", 1))
         with col4:
             st.metric("Rounds", st.session_state.debate_result.get("num_rounds", 1))
+            
+        # Display Evaluation Metrics
+        metrics = st.session_state.debate_result.get("metrics")
+        if metrics:
+            st.markdown("### 📊 Evaluation Metrics")
+            m_col1, m_col2, m_col3 = st.columns(3)
+            with m_col1:
+                st.metric("Avg Information Gain", f"{metrics.get('average_information_gain', 0):.2f}")
+                adherence = metrics.get('format_adherence_percent', 0)
+                st.metric("Format Adherence", f"{adherence:.1f}%")
+            with m_col2:
+                faithfulness_scores = metrics.get('turn_faithfulness', [])
+                avg_faith = (sum(faithfulness_scores) / len(faithfulness_scores)) * 100 if faithfulness_scores else 0
+                st.metric("Avg Turn Faithfulness", f"{avg_faith:.1f}%")
+                
+                search_eff = metrics.get('search_efficiency', {})
+                total_s = search_eff.get('total_searches', 0)
+                empty_s = search_eff.get('empty_searches', 0)
+                st.metric("Search Efficiency", f"{total_s - empty_s}/{total_s} effective")
+            with m_col3:
+                ps_scores = metrics.get('position_swap_scores', [])
+                if ps_scores:
+                    last_swap = ps_scores[-1]
+                    normal_c = last_swap.get('normal', {}).get('consensus', 0)
+                    swapped_c = last_swap.get('swapped', {}).get('consensus', 0)
+                    st.metric("Position Swap Delta", f"{abs(normal_c - swapped_c)} pts")
+                else:
+                    st.metric("Position Swap Delta", "N/A")
+                    
+            if metrics.get("is_repetitive_loop"):
+                st.warning("⚠️ Warning: Debate detected as a repetitive loop (low information gain).")
         
         # Full responses
         st.markdown("### 📝 Full Debate Transcript")
@@ -431,15 +454,27 @@ with col_debate:
         # Display all proposer responses by round
         proposer_responses = st.session_state.debate_result.get("proposer_responses", [])
         critic_responses = st.session_state.debate_result.get("critic_responses", [])
+        search_results = st.session_state.debate_result.get("search_results", [])
         
         for round_num, (round_props, round_critique) in enumerate(zip(proposer_responses, critic_responses), 1):
             with st.expander(f"🔄 Round {round_num}", expanded=round_num == 1):
+                # Round search results (if available)
+                if round_num <= len(search_results):
+                    round_searches = search_results[round_num-1]
+                    for i, s_res in enumerate(round_searches, 1):
+                        if s_res:
+                            with st.container():
+                                st.markdown(f"**🔍 Proposer {i} Research Sources:**")
+                                st.info(s_res)
+                
+                st.markdown("---")
+                
                 for i, prop_response in enumerate(round_props, 1):
-                    st.markdown(f"**Proposer {i}:**")
+                    st.markdown(f"**🗣️ Proposer {i}:**")
                     st.markdown(prop_response)
                     st.markdown("---")
                 
-                st.markdown(f"**Critic's Critique:**")
+                st.markdown(f"**🔍 Critic's Critique:**")
                 st.markdown(round_critique)
         
         # Judge's verdict
