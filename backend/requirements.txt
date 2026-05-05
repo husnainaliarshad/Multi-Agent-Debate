@@ -1,8 +1,9 @@
 fastapi
 uvicorn[standard]
+langchain>=0.1.0
 langchain-openai
+langchain-groq
 langgraph
-streamlit
 pydantic
 pydantic-settings
 python-dotenv
@@ -13,3 +14,8 @@ psycopg2-binary
 sqlalchemy
 sentence-transformers
 scikit-learn
+chromadb
+pandas
+plotly
+matplotlib
+numpy

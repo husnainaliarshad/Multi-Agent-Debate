@@ -99,6 +99,8 @@ class DebateMetrics:
         self.turn_faithfulness: List[float] = []
         self.format_adherence: Dict[str, int] = {"valid": 0, "total": 0}
         self.search_efficiency: Dict[str, int] = {"total_searches": 0, "redundant_searches": 0, "empty_searches": 0}
+        self.ground_truth: Optional[str] = None
+        self.stance_detection_correct: Optional[bool] = None
     
     def add_proposer_response(self, response: str):
         """Add a proposer response and calculate information gain."""
@@ -134,6 +136,26 @@ class DebateMetrics:
             all_responses.append(c)
         return detect_repetitive_loop(all_responses, threshold)
     
+    def calculate_spb_score(self) -> float:
+        """
+        Calculate Self-Preference Bias (SPB) score based on position swap data.
+        Higher score means more bias (deviation between normal and swapped runs).
+        """
+        if not self.position_swap_scores:
+            return 0.0
+        
+        last_run = self.position_swap_scores[-1]
+        normal_c = last_run.get("normal", {}).get("consensus", 0)
+        swapped_c = last_run.get("swapped", {}).get("consensus", 0)
+        
+        # Absolute difference is a simple proxy for bias
+        return float(abs(normal_c - swapped_c))
+
+    def evaluate_stance(self, verdict: str):
+        """Evaluate if the verdict matches ground truth."""
+        if self.ground_truth and verdict:
+            self.stance_detection_correct = self.ground_truth.lower() in verdict.lower()
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert metrics to dictionary for serialization."""
         return {
@@ -146,5 +168,7 @@ class DebateMetrics:
             "turn_faithfulness": [float(x) for x in self.turn_faithfulness],
             "format_adherence": self.format_adherence,
             "format_adherence_percent": (self.format_adherence["valid"] / self.format_adherence["total"] * 100) if self.format_adherence["total"] > 0 else 0,
-            "search_efficiency": self.search_efficiency
+            "search_efficiency": self.search_efficiency,
+            "spb_score": float(self.calculate_spb_score()),
+            "stance_detection_correct": self.stance_detection_correct
         }

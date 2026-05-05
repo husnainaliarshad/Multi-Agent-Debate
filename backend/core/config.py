@@ -21,6 +21,9 @@ class DebateConfig(BaseSettings):
     model_provider: str = Field(default="openai", description="Model provider")
     base_url: str = Field(default="http://localhost:1234/v1", description="Base URL for model API")
     api_key: str = Field(default="lm-studio", description="API key")
+    groq_api_key: Optional[str] = Field(default=None, description="Groq API key")
+    use_rag: bool = Field(default=False, description="Whether to use RAG with LegalBench")
+    mode: str = Field(default="hybrid", description="Configuration mode for benchmarking")
 
 
 class Settings(BaseSettings):

@@ -1,4 +1,3 @@
 @echo off
-cd backend
-call venv\Scripts\activate
-streamlit run dashboard.py
+call backend\venv\Scripts\activate
+streamlit run frontend\dashboard.py

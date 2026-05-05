@@ -8,9 +8,12 @@ import time
 import json
 import uuid
 import os
-from tools import search_tool
-from config import AgentConfig, DebateConfig, DEFAULT_PROPOSER_PROMPT, DEFAULT_CRITIC_PROMPT, DEFAULT_JUDGE_PROMPT
-from evaluation import DebateMetrics, calculate_turn_faithfulness
+from utils.tools import search_tool
+from core.config import AgentConfig, DebateConfig, DEFAULT_PROPOSER_PROMPT, DEFAULT_CRITIC_PROMPT, DEFAULT_JUDGE_PROMPT
+from core.evaluation import DebateMetrics, calculate_turn_faithfulness
+from services.rag_service import RAGService
+from core.stability import StabilityMonitor
+import random
 
 
 class DebateState(TypedDict):
@@ -47,11 +50,21 @@ class DebateAgent:
         # Merge max_tokens with any other model_kwargs from environment or config
         model_kwargs = {"max_tokens": max_tokens}
             
+        # Handle Groq provider specifically
+        api_key = debate_config.api_key
+        base_url = debate_config.base_url
+        provider = debate_config.model_provider
+        
+        if provider == "groq":
+            api_key = debate_config.groq_api_key
+            # init_chat_model for groq might not need base_url unless it's a proxy
+            base_url = None 
+            
         self.model = init_chat_model(
             config.model,
-            model_provider=debate_config.model_provider,
-            base_url=debate_config.base_url,
-            api_key=debate_config.api_key,
+            model_provider=provider,
+            base_url=base_url,
+            api_key=api_key,
             temperature=config.temperature,
             model_kwargs=model_kwargs
         )
@@ -115,10 +128,11 @@ class DebateAgent:
 class ProposerAgent(DebateAgent):
     """Proposer agent that generates the initial argument."""
     
-    def __init__(self, config: AgentConfig, debate_config: DebateConfig, max_tokens: int = 500, use_search: bool = False):
+    def __init__(self, config: AgentConfig, debate_config: DebateConfig, max_tokens: int = 500, use_search: bool = False, rag_service: RAGService = None):
         super().__init__(config, debate_config, "proposer", max_tokens)
         self.system_prompt = config.system_prompt or DEFAULT_PROPOSER_PROMPT
         self.use_search = use_search
+        self.rag_service = rag_service
     
     def generate_argument(self, topic: str, round_num: int = 1, proposer_id: int = 1) -> Dict[str, Any]:
         """Generate the initial argument on the topic."""
@@ -139,6 +153,15 @@ class ProposerAgent(DebateAgent):
         if search_results:
             prompt += f"Background Information/Search Results:\n{search_results}\n\n"
             prompt += "CRITICAL: You MUST incorporate the facts and evidence from the search results above into your argument. Cite specific details.\n\n"
+        
+        # Add RAG results if enabled
+        if self.rag_service:
+            print(f"[{self.role}] Querying LegalBench RAG for: {topic}")
+            rag_results = self.rag_service.query(topic)
+            if rag_results:
+                prompt += f"LegalBench Reference Information:\n{rag_results}\n\n"
+                prompt += "CRITICAL: You MUST incorporate relevant legal principles or case details from the LegalBench references above.\n\n"
+                self._emit_event("SEARCH_COMPLETE", {"proposer_id": proposer_id, "results": f"RAG Results:\n{rag_results}"})
         
         prompt += "Generate your argument."
         return self.invoke(prompt, self.system_prompt)
@@ -177,16 +200,19 @@ class JudgeAgent(DebateAgent):
         super().__init__(config, debate_config, "judge", max_tokens)
         self.system_prompt = config.system_prompt or DEFAULT_JUDGE_PROMPT
     
-    def judge(self, proposer_argument: str, critic_argument: str) -> Dict[str, Any]:
+    def judge(self, proposer_argument: str, critic_argument: str, mode: str = "normal") -> Dict[str, Any]:
         """Judge the debate and provide a verdict."""
-        prompt = f"""Proposer's Argument:\n{proposer_argument}\n\nCritic's Critique:\n{critic_argument}\n\nProvide your verdict and consensus score."""
+        if mode == "irac":
+            prompt = proposer_argument # The summary is already formatted for IRAC
+        else:
+            prompt = f"""Proposer's Argument:\n{proposer_argument}\n\nCritic's Critique:\n{critic_argument}\n\nProvide your verdict and consensus score."""
         return self.invoke(prompt, self.system_prompt)
 
 
 class DebateOrchestrator:
     """Orchestrates the multi-agent debate."""
     
-    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False, use_position_swap: bool = True, use_info_gain: bool = True, use_faithfulness: bool = True, use_summary_relay: bool = True):
+    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False, use_position_swap: bool = True, use_info_gain: bool = True, use_faithfulness: bool = True, use_summary_relay: bool = True, use_rag: bool = False, rag_service: RAGService = None):
         self.config = config
         self.max_tokens = max_tokens
         self.num_rounds = num_rounds
@@ -195,12 +221,19 @@ class DebateOrchestrator:
         self.use_info_gain = use_info_gain
         self.use_faithfulness = use_faithfulness
         self.use_summary_relay = use_summary_relay
+        self.use_rag = use_rag
+        self.mode = config.mode if hasattr(config, 'mode') else "hybrid"
+        self.use_stability = True
+        self.stability_monitor = StabilityMonitor()
+        
+        # Use provided RAG service or initialize only if requested and not provided
+        self.rag_service = rag_service if rag_service else (RAGService() if use_rag else None)
         
         # Fresh model initialization for each agent to flush context
         if proposer_configs:
-            self.proposers = [ProposerAgent(cfg, config, max_tokens, use_search=use_search) for cfg in proposer_configs]
+            self.proposers = [ProposerAgent(cfg, config, max_tokens, use_search=use_search, rag_service=self.rag_service) for cfg in proposer_configs]
         else:
-            self.proposers = [ProposerAgent(config.proposer, config, max_tokens, use_search=use_search)]
+            self.proposers = [ProposerAgent(config.proposer, config, max_tokens, use_search=use_search, rag_service=self.rag_service)]
         
         for p in self.proposers:
             p.set_event_callback(self._emit_event)
@@ -218,7 +251,7 @@ class DebateOrchestrator:
 
 
 
-    def _emit_event(self, event_type: str, data: Dict[str, Any], topic: str = None):
+    def _emit_event(self, event_type: str, data: Dict[str, Any]):
         """Emit an event for streaming."""
         event = {
             "event_type": event_type,
@@ -245,6 +278,22 @@ class DebateOrchestrator:
             for round_num in range(1, self.num_rounds + 1):
                 print(f"[{self.session_id}] Round {round_num}/{self.num_rounds}")
                 self._emit_event("ROUND_START", {"round": round_num, "total_rounds": self.num_rounds})
+                
+                # RESEARCH MODE: Baseline (Single Agent, No Debate)
+                if self.mode == "baseline":
+                    print(f"[{self.session_id}] Mode: Baseline (Single Agent)")
+                    res = self.proposers[0].generate_argument(topic, round_num=1)
+                    all_proposer_arguments.append([res["content"]])
+                    # In baseline, we go straight to judging the single response
+                    debate_summary = f"Topic: {topic}\n\nModel Response:\n{res['content']}"
+                    break # Exit round loop
+                
+                # RESEARCH MODE: Naive RAG (Pre-retrieve once)
+                if self.mode == "naive_rag" and round_num == 1:
+                    print(f"[{self.session_id}] Mode: Naive RAG")
+                    # Pre-retrieve context for all agents
+                    context = self.rag_service.query(topic) if self.rag_service else ""
+                    topic = f"{topic}\n\nCONTEXT FROM LEGALBENCH:\n{context}"
                 
                 # All proposers generate arguments in parallel
                 round_proposer_results = []
@@ -275,6 +324,9 @@ class DebateOrchestrator:
                             round_num=round_num,
                             proposer_id=i+1
                         )
+                    
+                    # Authorship Obfuscation (Simple perturbation for SPB mitigation)
+                    result["content"] = self._obfuscate_authorship(result["content"])
                     
                     round_proposer_results.append(result)
                     
@@ -313,6 +365,14 @@ class DebateOrchestrator:
                     print(f"[{self.session_id}] Proposer {i+1} complete")
                 
                 all_proposer_arguments.append([r["content"] for r in round_proposer_results])
+                
+                # ADAPTIVE STOPPING: Check stability after each round (except last)
+                if self.num_rounds > 1 and round_num < self.num_rounds and self.mode != "baseline":
+                    current_stances = [self._extract_consensus_score(r["content"]) for r in round_proposer_results]
+                    if self.stability_monitor.check_stability(current_stances):
+                        print(f"[{self.session_id}] Adaptive Stopping triggered: Opinion stability reached at round {round_num}")
+                        self._emit_event("ADAPTIVE_STOPPING", {"round": round_num})
+                        break
                 all_search_results.append(round_search_results)
                 
                 # Critic critiques all proposer arguments
@@ -383,8 +443,11 @@ class DebateOrchestrator:
             if self.use_position_swap:
                 self._emit_event("JUDGE_THOUGHT", {"thought": "Running position-swapped evaluation to reduce bias..."})
                 
-                # First run: normal order (Proposer then Critic)
-                judge_result_normal = self.judge.judge(debate_summary, "")
+                # Cognitive Load Decomposition: IRAC Judge Prompting
+                irac_summary = self._format_irac_summary(debate_summary)
+                
+                # Normal run
+                judge_result_normal = self.judge.judge(irac_summary, "", mode="irac")
                 consensus_normal = self._extract_consensus_score(judge_result_normal["content"])
                 verdict_normal = self._extract_verdict(judge_result_normal["content"])
                 
@@ -498,3 +561,30 @@ class DebateOrchestrator:
         elif "critic" in judge_response.lower():
             return "Critic"
         return "Inconclusive"
+
+    def _obfuscate_authorship(self, text: str) -> str:
+        """Apply simple perturbations to obfuscate authorship."""
+        replacements = {
+            "I believe": "It is argued that",
+            "In my opinion": "Analysis suggests",
+            "I strongly agree": "There is strong support for",
+            "Furthermore": "In addition",
+            "However": "Conversely"
+        }
+        obfuscated = text
+        for old, new in replacements.items():
+            obfuscated = obfuscated.replace(old, new)
+        return obfuscated
+
+    def _format_irac_summary(self, summary: str) -> str:
+        """Helper to structure the debate summary for IRAC evaluation."""
+        return f"""Please evaluate the following legal debate using the IRAC framework:
+        
+{summary}
+
+Evaluate each of the following components separately:
+1. ISSUE: Did the proposer correctly identify the legal issue?
+2. RULE: Was the cited legal rule/statute accurate and relevant?
+3. APPLICATION: Was the rule logically applied to the facts?
+4. CONCLUSION: Is the final conclusion legally sound?
+"""

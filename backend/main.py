@@ -4,12 +4,14 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import json
 import requests
-from config import DebateConfig, AgentConfig, Settings, JUDGE_PROFILES
-from agents import DebateOrchestrator
-from database import init_db, get_debate_events, get_recent_debates, delete_debate_session, save_debate_session
+from core.config import DebateConfig, AgentConfig, Settings, JUDGE_PROFILES
+from core.agents import DebateOrchestrator
+from core.database import init_db, get_debate_events, get_recent_debates, delete_debate_session, save_debate_session
 from dotenv import load_dotenv
 import os
 import threading
+from services.experiment_manager import experiment_manager
+from services.rag_service import RAGService
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +32,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     init_db()
+
+# Initialize shared RAG service
+rag_service = RAGService()
 
 # In-memory session storage
 sessions: Dict[str, DebateOrchestrator] = {}
@@ -59,6 +64,8 @@ class DebateInitRequest(BaseModel):
     max_rounds: Optional[int] = 1
     max_tokens: Optional[int] = 500
     use_search: Optional[bool] = True
+    use_rag: Optional[bool] = False
+    model_provider: Optional[str] = "openai"
 
 class DebateInitResponse(BaseModel):
     session_id: str
@@ -101,9 +108,11 @@ def init_debate(request: DebateInitRequest):
                 system_prompt=judge_system_prompt
             ),
             max_rounds=request.max_rounds,
-            model_provider=os.getenv("MODEL_PROVIDER", "openai"),
+            model_provider=request.model_provider or os.getenv("MODEL_PROVIDER", "openai"),
             base_url=os.getenv("BASE_URL", "http://localhost:1234/v1"),
-            api_key=os.getenv("API_KEY", "lm-studio")
+            api_key=os.getenv("API_KEY", "lm-studio"),
+            groq_api_key=os.getenv("GROQ_KEY"),
+            use_rag=request.use_rag or False
         )
         
         # Create orchestrator with multiple proposers and rounds
@@ -116,7 +125,9 @@ def init_debate(request: DebateInitRequest):
             use_position_swap=request.use_position_swap or True,
             use_info_gain=request.use_info_gain or True,
             use_faithfulness=request.use_faithfulness or True,
-            use_summary_relay=request.use_summary_relay or True
+            use_summary_relay=request.use_summary_relay or True,
+            use_rag=request.use_rag or False,
+            rag_service=rag_service
         )
         session_id = orchestrator.session_id
         
@@ -233,23 +244,38 @@ def get_available_models():
         if response.status_code == 200:
             data = response.json()
             print(f"Parsed data: {data}")
-            models = data.get("data", [])
-            model_names = [model.get("id", "") for model in models]
-            print(f"Model names: {model_names}")
+            models_data = data.get("data", [])
+            model_names = [model.get("id", "") for model in models_data]
+            # Add Groq models if API key is present
+            groq_key = os.getenv("GROQ_KEY")
+            if groq_key:
+                groq_models = ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]
+                return {"models": model_names + groq_models, "groq_models": groq_models}
+                
             return {"models": model_names}
         else:
             # Return default models if LM Studio is not responding
+            groq_key = os.getenv("GROQ_KEY")
+            defaults = ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"]
+            if groq_key:
+                groq_models = ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]
+                return {"models": defaults + groq_models, "groq_models": groq_models, "warning": "Could not connect to LM Studio, but Groq is available"}
+            
             return {
-                "models": ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
+                "models": defaults,
                 "warning": f"Could not connect to LM Studio (status {response.status_code}), using default models"
             }
     except Exception as e:
         # Return default models on error
         print(f"Error fetching models: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        groq_key = os.getenv("GROQ_KEY")
+        defaults = ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"]
+        if groq_key:
+            groq_models = ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]
+            return {"models": defaults + groq_models, "groq_models": groq_models, "warning": "Error fetching local models, but Groq is available"}
+            
         return {
-            "models": ["liquid/lfm2.5-1.2b", "liquid/lfm2.5-3b", "llama-3.2-3b"],
+            "models": defaults,
             "warning": f"Error fetching models: {str(e)}"
         }
 
@@ -276,3 +302,45 @@ def dummy_debate():
 @app.get("/")
 def root():
     return {"status": "running", "message": "Multi-Agent Debate Backend API"}
+
+# Experiment Endpoints
+class ExperimentInitRequest(BaseModel):
+    name: str
+    topics: List[str]
+    model_configs: List[Dict[str, Any]]
+    max_rounds: Optional[int] = 1
+    repeats: Optional[int] = 1
+    use_rag: Optional[bool] = False
+    use_search: Optional[bool] = True
+
+@app.post("/experiments/run")
+def run_experiment_endpoint(request: ExperimentInitRequest):
+    """Start a batch experiment."""
+    try:
+        experiment_id = experiment_manager.start_experiment(request.dict())
+        return {"experiment_id": experiment_id, "status": "started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start experiment: {str(e)}")
+
+@app.get("/experiments/list")
+def list_experiments_endpoint():
+    """List all experiments."""
+    return {"experiments": experiment_manager.list_experiments()}
+
+@app.get("/experiments/status/{experiment_id}")
+def get_experiment_status_endpoint(experiment_id: str):
+    """Get the status of an experiment."""
+    status = experiment_manager.get_status(experiment_id)
+    if status["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    return status
+@app.get("/prompts/export")
+async def export_system_prompts():
+    from utils.export_prompts import export_prompts
+    try:
+        file_path = export_prompts()
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"content": content, "filename": "prompts.txt"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

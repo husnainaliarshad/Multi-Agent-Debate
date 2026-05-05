@@ -3,6 +3,8 @@ import requests
 import json
 from typing import Dict, Any
 import time
+import pandas as pd
+import os
 
 # Page configuration
 st.set_page_config(
@@ -66,6 +68,9 @@ def display_event(event: Dict[str, Any], event_index: int = 0):
         st.success("✅ Judge's verdict complete")
         with st.expander("View Judge's Response"):
             st.markdown(data.get("response", ""))
+    elif event_type == "ADAPTIVE_STOPPING":
+        round_num = data.get("round", 1)
+        st.success(f"🛑 Adaptive Stopping Triggered: Consensus reached at Round {round_num}.")
     elif event_type == "DEBATE_COMPLETE":
         st.balloons()
         st.info(f"🎉 Debate complete with {data.get('num_proposers', 1)} proposer(s) and {data.get('num_rounds', 1)} round(s)")
@@ -136,8 +141,8 @@ with col_config:
     st.markdown("---")
     
     # Organize parameters into Tabs
-    tab_struct, tab_agents, tab_eval, tab_adv = st.tabs([
-        "🏗️ Structure", "🤖 Agents", "📊 Evaluation", "⚙️ Advanced"
+    tab_struct, tab_agents, tab_eval, tab_adv, tab_exp = st.tabs([
+        "🏗️ Structure", "🤖 Agents", "📊 Evaluation", "⚙️ Advanced", "🔬 Experiments"
     ])
     
     with tab_struct:
@@ -145,24 +150,54 @@ with col_config:
         num_proposers = st.slider("Number of Proposers", 1, 5, 1, 1)
         max_rounds = st.slider("Number of Rounds", 1, 5, 1, 1)
         use_search = st.checkbox("🔍 Enable Internet Search (DuckDuckGo)", value=True, help="Allow proposers to search for evidence online")
+        use_rag = st.checkbox("📚 Enable LegalBench RAG", value=False, help="Use local LegalBench dataset for legal context")
+        
+        if st.button("📊 Analyze LegalBench Dataset"):
+            st.markdown("#### 📚 Dataset Analytics (LegalBench-RAG)")
+            # Mock analytics for now, or real ones if RAG service available
+            col1, col2 = st.columns(2)
+            col1.metric("Total Documents", "698")
+            col2.metric("Total Tokens", "~79M")
+            st.info("Dataset includes: NDAs, M&A agreements, commercial contracts, and privacy policies.")
+            
+            # Simple bar chart of contract types (mock data based on LegalBench spec)
+            data = {"Contract Type": ["NDA", "M&A", "Privacy", "Commercial"], "Count": [210, 150, 180, 158]}
+            df_rag = pd.DataFrame(data)
+            st.bar_chart(df_rag.set_index("Contract Type"))
     
     with tab_agents:
         # Fetch available models from LM Studio
-        @st.cache_data(ttl=300)  # Cache for 5 minutes
-        def get_available_models():
-            """Fetch available models from the backend."""
+        @st.cache_data(ttl=300)
+        def get_model_data():
+            """Fetch models and provider info from the backend."""
             try:
                 response = requests.get(f"{API_BASE}/models", timeout=5)
                 if response.status_code == 200:
-                    data = response.json()
-                    if "warning" in data:
-                        st.warning(data["warning"])
-                    return data.get("models", ["liquid/lfm2.5-1.2b"])
-                return ["liquid/lfm2.5-1.2b"]
-            except:
-                return ["liquid/lfm2.5-1.2b"]
-        
+                    return response.json()
+                return {"models": ["liquid/lfm2.5-1.2b"]}
+            except Exception:
+                return {"models": ["liquid/lfm2.5-1.2b"]}
+
         st.markdown("### 🤖 Model Selection")
+        
+        model_data = get_model_data()
+        available_models = model_data.get("models", [])
+        groq_models = model_data.get("groq_models", [])
+        
+        provider_options = ["LM Studio (Local)"]
+        if groq_models:
+            provider_options.append("Groq (Cloud)")
+            
+        model_provider_ui = st.selectbox("Model Provider", provider_options, index=0)
+        model_provider = "openai" if model_provider_ui == "LM Studio (Local)" else "groq"
+        
+        # Filter models based on provider
+        if model_provider == "groq":
+            available_models = groq_models
+        else:
+            # Filter out groq models from local list if they were mixed
+            available_models = [m for m in available_models if m not in groq_models]
+
         col_refresh, col_label = st.columns([1, 5])
         with col_refresh:
             refresh_models = st.button("🔄", help="Refresh models from LM Studio")
@@ -173,7 +208,7 @@ with col_config:
             st.cache_data.clear()
             st.rerun()
             
-        available_models = get_available_models()
+        # available_models is already set above based on provider
         
         if len(available_models) > 0:
             critic_model = st.selectbox("Critic Model", available_models, index=0)
@@ -246,6 +281,169 @@ with col_config:
                     st.error(f"Failed to load dummy debate: {dummy_response.text}")
             except Exception as e:
                 st.error(f"Error loading dummy debate: {str(e)}")
+                
+    with tab_exp:
+        st.markdown("### 🔬 Batch Experiment Builder")
+        exp_name = st.text_input("Experiment Name", "Model Comparison Study")
+        
+        # Multi-topic selection
+        exp_topics_str = st.text_area("Debate Topics (one per line)", 
+            "Should AI be granted legal personhood?\nIs digital privacy a human right?")
+        exp_topics = [t.strip() for t in exp_topics_str.split("\n") if t.strip()]
+        
+        col_exp1, col_exp2 = st.columns(2)
+        with col_exp1:
+            exp_rounds = st.slider("Rounds per Debate", 1, 5, 2)
+            exp_repeats = st.slider("Repeats per Config", 1, 5, 1)
+        with col_exp2:
+            exp_use_search = st.checkbox("Enable Search", value=True, key="exp_search")
+            exp_use_rag = st.checkbox("Enable LegalBench RAG", value=True, key="exp_rag")
+            
+        st.markdown("#### 🤖 Model Backbone (for SLM profiles)")
+        selected_models = st.multiselect("Select SLM models to use", available_models, default=[available_models[0]] if available_models else [])
+        
+        st.markdown("#### ⚖️ Research Configuration Profiles")
+        research_profiles = st.multiselect("Select Profiles to Benchmark", [
+            "Baseline (Single 70B Model)",
+            "SLM MAD (ReAct Only)",
+            "SLM MAD (Naive RAG)",
+            "SLM MAD (Active RAG)",
+            "SLM MAD (Hybrid / Proposed)"
+        ], default=["Baseline (Single 70B Model)", "SLM MAD (Hybrid / Proposed)"])
+        
+        if st.button("🚀 Start Research Experiment", type="primary"):
+            if not exp_topics or not research_profiles:
+                st.error("Please provide topics and select profiles.")
+            else:
+                with st.spinner("Starting research experiment..."):
+                    model_configs = []
+                    for profile in research_profiles:
+                        if "Baseline" in profile:
+                            model_configs.append({
+                                "proposer_model": "llama-3.1-70b-versatile",
+                                "critic_model": "llama-3.1-70b-versatile",
+                                "judge_model": "llama-3.1-70b-versatile",
+                                "provider": "groq",
+                                "mode": "baseline"
+                            })
+                        elif "ReAct Only" in profile:
+                            model_configs.append({"mode": "react_only", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+                        elif "Naive RAG" in profile:
+                            model_configs.append({"mode": "naive_rag", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+                        elif "Active RAG" in profile:
+                            model_configs.append({"mode": "active_rag", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+                        elif "Hybrid" in profile:
+                            model_configs.append({"mode": "hybrid", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+
+                    try:
+                        exp_resp = requests.post(f"{API_BASE}/experiments/run", json={
+                            "name": exp_name,
+                            "topics": exp_topics,
+                            "model_configs": model_configs,
+                            "max_rounds": exp_rounds,
+                            "repeats": exp_repeats,
+                            "use_rag": exp_use_rag,
+                            "use_search": exp_use_search
+                        })
+                        if exp_resp.status_code == 200:
+                            st.success(f"✅ Research experiment started! ID: {exp_resp.json()['experiment_id']}")
+                        else:
+                            st.error(f"Failed: {exp_resp.text}")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        
+        st.markdown("---")
+        st.markdown("### 📋 Active & Past Experiments")
+        @st.cache_data(ttl=10)
+        def get_experiments():
+            try:
+                response = requests.get(f"{API_BASE}/experiments/list", timeout=2)
+                if response.status_code == 200:
+                    return response.json().get("experiments", [])
+                return []
+            except:
+                return []
+
+        try:
+            exps = get_experiments()
+            if exps:
+                for ex in reversed(exps):
+                        with st.expander(f"{ex['name']} - {ex['status'].upper()}"):
+                            st.write(f"ID: {ex['id']}")
+                            st.write(f"Topics: {len(ex['config']['topics'])}")
+                            st.write(f"Total Runs: {ex['total_runs']}")
+                            if ex['status'] == 'completed':
+                                # Provide link to CSV results (assuming server serves it or we show a preview)
+                                st.success("Completed!")
+                                if st.button("📊 View Results Summary", key=f"view_{ex['id']}"):
+                                    st.info("Results table feature coming soon! Check backend/data/experiments/ for CSV.")
+                            elif ex['status'] == 'running':
+                                st.info("Running...")
+                                st.progress(ex.get('progress', 0))
+            else:
+                st.error(f"Error fetching experiments: {list_resp.text}")
+        except Exception as e:
+            st.error(f"Error loading experiment list: {e}")
+                                
+        st.markdown("---")
+        with st.expander("📊 Research Results Visualizer", expanded=False):
+            st.markdown("### 📊 Research Results Visualizer")
+        
+        # Look for experiment folders
+        exp_base = "backend/data/experiments"
+        if os.path.exists(exp_base):
+            exp_folders = [d for d in os.listdir(exp_base) if os.path.isdir(os.path.join(exp_base, d))]
+            if exp_folders:
+                selected_exp = st.selectbox("Select Experiment to Visualize", exp_folders)
+                csv_path = f"{exp_base}/{selected_exp}/results.csv"
+                
+                if os.path.exists(csv_path):
+                    @st.cache_data(ttl=60)
+                    def load_exp_results(path):
+                        return pd.read_csv(path)
+                        
+                    df = load_exp_results(csv_path)
+                    st.write(f"Showing results for {len(df)} runs.")
+                    
+                    # Visualization 1: Consensus Score by Configuration
+                    st.markdown("#### Consensus Score by Research Configuration")
+                    if "mode" in df.columns:
+                        avg_scores = df.groupby("mode")["consensus_score"].mean().reset_index()
+                        st.bar_chart(avg_scores.set_index("mode"))
+                    
+                    # Visualization 2: Information Gain (Debate Depth)
+                    st.markdown("#### Average Information Gain per Run")
+                    st.line_chart(df["avg_info_gain"])
+                    
+                    # Visualization 3: Faithfulness & Efficiency
+                    col_v1, col_v2 = st.columns(2)
+                    with col_v1:
+                        st.markdown("#### Turn Faithfulness")
+                        st.bar_chart(df["faithfulness"])
+                    with col_v2:
+                        st.markdown("#### Format Adherence (%)")
+                        st.bar_chart(df["format_adherence"])
+                        
+                    st.download_button("📥 Download Aggregated CSV", 
+                                      data=df.to_csv(index=False), 
+                                      file_name=f"experiment_{selected_exp}.csv")
+                else:
+                    st.write("No results.csv found in this folder.")
+            else:
+                st.write("No experiment data found yet.")
+        
+        st.markdown("---")
+        if st.button("📝 Export System Prompts for Submission"):
+            try:
+                resp = requests.get(f"{API_BASE}/prompts/export", timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    st.success("✅ Prompts retrieved from backend!")
+                    st.download_button("📥 Download prompts.txt", data["content"], file_name=data["filename"])
+                else:
+                    st.error(f"Failed to export prompts: {resp.text}")
+            except Exception as e:
+                st.error(f"Error: {e}")
     
     # Initialize debate button
     st.markdown("---")
@@ -283,7 +481,9 @@ with col_config:
                         "use_summary_relay": use_summary_relay,
                         "max_rounds": max_rounds,
                         "max_tokens": max_tokens,
-                        "use_search": use_search
+                        "use_search": use_search,
+                        "use_rag": use_rag,
+                        "model_provider": model_provider
                     }
                 )
                 
@@ -444,6 +644,9 @@ with col_debate:
                     st.metric("Position Swap Delta", f"{abs(normal_c - swapped_c)} pts")
                 else:
                     st.metric("Position Swap Delta", "N/A")
+                
+                spb = metrics.get('spb_score', 0)
+                st.metric("SPB Bias Score", f"{spb:.1f}")
                     
             if metrics.get("is_repetitive_loop"):
                 st.warning("⚠️ Warning: Debate detected as a repetitive loop (low information gain).")
