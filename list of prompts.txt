@@ -1,0 +1,129 @@
+﻿=== GEN AI FINAL PROJECT - DEVELOPER PROMPT LOG ===
+Project: Multi-Agent Debate Research Platform
+Course: Fall26 GenAI Final Project
+
+This file contains the actual developer prompts used to build the project
+via conversational AI assistance (Cascade / Windsurf / ChatGPT / Claude).
+They are reconstructed from the project evolution as documented in
+NEXT_STEPS.md, RESULT_COMPILATION_TASKS.md, and the final codebase.
+
+============================================================
+
+PHASE 1: PROJECT SETUP & ARCHITECTURE
+------------------------------------------------------------
+
+P1.1  scaffold a fastapi backend with pydantic models for a multi-agent debate system. i need endpoints for init, events, result, save, delete. use sqlite for persistence.
+
+P1.2  build a streamlit frontend dashboard with sidebar config, real-time polling for debate events, and a results viewer. connect it to localhost:8001.
+
+P1.3  design the agent architecture: Proposer, Critic, Judge classes using langchain init_chat_model with configurable provider (openai-compatible for LM Studio). add event emission callbacks.
+
+P1.4  create a DebateOrchestrator that runs multiple proposers across multiple rounds, supports position swapping, info-gain tracking, and adaptive stopping.
+
+P1.5  add evaluation metrics module with sentence-transformer cosine dissimilarity for information gain, turn faithfulness vs search results, format adherence, SPB score from position swap.
+
+============================================================
+
+PHASE 2: RETRIEVAL & SEARCH INTEGRATION
+------------------------------------------------------------
+
+P2.1  implement a DuckDuckGo search tool wrapper that returns formatted snippets for agent use.
+
+P2.2  build a RAGService using ChromaDB and all-MiniLM-L6-v2 to index the LegalBench-RAG corpus. support paragraph chunking, batched adds, and structured query results with file paths and char spans.
+
+P2.3  wire search and RAG into the debate loop so proposers can include evidence and critics can research counter-arguments.
+
+============================================================
+
+PHASE 3: RESEARCH MODES
+------------------------------------------------------------
+
+P3.1  define behaviorally distinct modes: baseline (single agent, no tools), react_only (search enabled, no RAG), naive_rag (one-time corpus retrieval), active_rag (iterative per-round retrieval), hybrid (search + RAG).
+
+P3.2  implement mode capability resolution in DebateOrchestrator so each mode triggers the correct combination of search, shared_initial_rag, and iterative_rag.
+
+P3.3  add mode-aware query builders: proposer search query, critic search query, proposer RAG query. round 1 should query the topic; later rounds should include the previous critique.
+
+P3.4  ensure the backend result payload always returns mode, provider, use_rag, use_search so experiment CSVs are reliable.
+
+============================================================
+
+PHASE 4: EXPERIMENTATION INFRASTRUCTURE
+------------------------------------------------------------
+
+P4.1  create a BatchRunner that takes an experiment config (topics, model_configs, repeats) and produces results.csv with all required metadata columns.
+
+P4.2  build an ExperimentManager singleton that runs experiments in background threads, tracks progress, and exposes status endpoints.
+
+P4.3  write an experiment validator that checks results.csv for missing columns, duplicate rows, zero-metric runs, and mode/search/rag mismatches.
+
+P4.4  add an /experiments/run endpoint to main.py and hook it into the frontend batch experiment builder with pilot mode support.
+
+============================================================
+
+PHASE 5: LEGALBENCH BENCHMARK SCORING
+------------------------------------------------------------
+
+P5.1  create a separate LegalBenchBenchmarkService that loads benchmark JSONs, queries the RAG service, and compares retrieved files/spans against ground truth.
+
+P5.2  compute file-level and span-level metrics: top1_file_hit, file_hit_at_k, file_precision_at_k, file_recall_at_k, best_span_recall, top1_span_recall, answer_coverage_at_k.
+
+P5.3  add a LegalBenchBenchmarkManager with background runs, progress callbacks, and summary CSV/JSON output. keep it completely separate from debate orchestration.
+
+P5.4  expose /benchmarks/legalbench/run and /benchmarks/legalbench/status endpoints.
+
+============================================================
+
+PHASE 6: REPORT COMPILATION
+------------------------------------------------------------
+
+P6.1  build a ReportCompilerService that discovers completed experiments and benchmark runs, then aggregates them into tables.
+
+P6.2  generate debate_by_mode.csv, debate_by_topic_mode.csv, topic consensus pivot, and topic deltas (active_rag vs naive_rag, hybrid vs react_only, etc.).
+
+P6.3  generate legalbench_by_dataset.csv with weighted averages across benchmark runs.
+
+P6.4  add guardrails: detect missing modes, low topic counts, missing benchmark data, and emit written warnings so the report claims match the actual data.
+
+P6.5  write a report_notes.txt with claim guardrails and a manifest.json tracking included inputs.
+
+============================================================
+
+PHASE 7: PROMPT ENGINEERING & REFINEMENTS
+------------------------------------------------------------
+
+P7.1  write IRAC-formatted judge instructions to reduce cognitive load and improve verdict consistency.
+
+P7.2  add authorship obfuscation replacements (I believe -> It is argued that, etc.) to mitigate self-preference bias before judging.
+
+P7.3  implement summary-based relay: after each round, use the judge model to summarize arguments and critiques so the next round gets condensed context instead of full history.
+
+P7.4  enforce token-limit meta-prompts dynamically based on max_tokens setting without breaking the structured output requirements.
+
+P7.5  create a /prompts/export backend endpoint and a frontend button so prompts can be downloaded for course submission.
+
+============================================================
+
+PHASE 8: SMOKE TESTING & FIXES
+------------------------------------------------------------
+
+P8.1  fix the batch runner so results.csv reliably captures topic, mode, provider, proposer_model, critic_model, judge_model, use_rag, use_search, repeat_index, session_id, and timestamp.
+
+P8.2  ensure failed runs still write a CSV row with status=failed, error message, and traceback so experiments are fully auditable.
+
+P8.3  verify LM Studio connectivity at startup and fall back to default models if the local server is unreachable.
+
+P8.4  add docker-compose and Dockerfiles for frontend and backend so the project is reproducible.
+
+============================================================
+
+PHASE 9: FINAL REPORT PREP
+------------------------------------------------------------
+
+P9.1  read the fall26_genai_final_project guidelines and ensure the submission package includes: all code, a Springer LNCS PDF report, and a plain text file of all GPT/developer prompts.
+
+P9.2  write the prompt submission text file in the root titled exactly "list of prompts" so it can be zipped with the code.
+
+============================================================
+
+End of Prompt Log
