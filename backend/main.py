@@ -13,6 +13,7 @@ import threading
 from services.experiment_manager import experiment_manager
 from services.rag_service import RAGService
 from services.experiment_validator import validate_experiment_results
+from services.legalbench_benchmark import legalbench_benchmark_manager
 
 # Load environment variables
 load_dotenv()
@@ -317,6 +318,12 @@ class ExperimentInitRequest(BaseModel):
     use_rag: Optional[bool] = False
     use_search: Optional[bool] = True
 
+class LegalBenchBenchmarkRunRequest(BaseModel):
+    name: Optional[str] = "LegalBench Retrieval Benchmark"
+    benchmarks: Optional[List[str]] = None
+    limit_per_benchmark: Optional[int] = None
+    n_results: Optional[int] = 5
+
 @app.post("/experiments/run")
 def run_experiment_endpoint(request: ExperimentInitRequest):
     """Start a batch experiment."""
@@ -346,6 +353,36 @@ def validate_experiment_endpoint(experiment_id: str):
         return validate_experiment_results(experiment_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate experiment: {str(e)}")
+
+@app.get("/benchmarks/legalbench/datasets")
+def list_legalbench_datasets_endpoint():
+    """List available LegalBench benchmark datasets."""
+    try:
+        return {"benchmarks": legalbench_benchmark_manager.list_benchmarks()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list benchmarks: {str(e)}")
+
+@app.post("/benchmarks/legalbench/run")
+def run_legalbench_benchmark_endpoint(request: LegalBenchBenchmarkRunRequest):
+    """Start a LegalBench retrieval benchmark run."""
+    try:
+        run_id = legalbench_benchmark_manager.start_run(request.dict())
+        return {"run_id": run_id, "status": "started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start LegalBench benchmark: {str(e)}")
+
+@app.get("/benchmarks/legalbench/status/{run_id}")
+def get_legalbench_benchmark_status_endpoint(run_id: str):
+    """Get the status of a LegalBench retrieval benchmark run."""
+    status = legalbench_benchmark_manager.get_status(run_id)
+    if status["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Benchmark run not found")
+    return status
+
+@app.get("/benchmarks/legalbench/list")
+def list_legalbench_benchmark_runs_endpoint():
+    """List LegalBench retrieval benchmark runs started in this process."""
+    return {"runs": legalbench_benchmark_manager.list_runs()}
 
 @app.get("/prompts/export")
 async def export_system_prompts():
