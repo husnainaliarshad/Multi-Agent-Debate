@@ -1,3 +1,2 @@
-@echo off
-call .venv\Scripts\activate
+call .\backend\venv\Scripts\activate
 streamlit run frontend\dashboard.py
