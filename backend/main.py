@@ -12,6 +12,7 @@ import os
 import threading
 from services.experiment_manager import experiment_manager
 from services.rag_service import RAGService
+from services.experiment_validator import validate_experiment_results
 
 # Load environment variables
 load_dotenv()
@@ -66,6 +67,7 @@ class DebateInitRequest(BaseModel):
     use_search: Optional[bool] = True
     use_rag: Optional[bool] = False
     model_provider: Optional[str] = "openai"
+    mode: Optional[str] = "hybrid"
 
 class DebateInitResponse(BaseModel):
     session_id: str
@@ -112,10 +114,12 @@ def init_debate(request: DebateInitRequest):
             base_url=os.getenv("BASE_URL", "http://localhost:1234/v1"),
             api_key=os.getenv("API_KEY", "lm-studio"),
             groq_api_key=os.getenv("GROQ_KEY"),
-            use_rag=request.use_rag or False
+            use_rag=request.use_rag or False,
+            mode=request.mode or "hybrid"
         )
         
         # Create orchestrator with multiple proposers and rounds
+        mode_requires_rag = (request.mode or "hybrid") in {"naive_rag", "active_rag", "hybrid"}
         orchestrator = DebateOrchestrator(
             config,
             max_tokens=request.max_tokens or 500,
@@ -127,7 +131,7 @@ def init_debate(request: DebateInitRequest):
             use_faithfulness=request.use_faithfulness or True,
             use_summary_relay=request.use_summary_relay or True,
             use_rag=request.use_rag or False,
-            rag_service=rag_service
+            rag_service=rag_service if (request.use_rag or mode_requires_rag) else None
         )
         session_id = orchestrator.session_id
         
@@ -334,6 +338,15 @@ def get_experiment_status_endpoint(experiment_id: str):
     if status["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Experiment not found")
     return status
+
+@app.get("/experiments/validate/{experiment_id}")
+def validate_experiment_endpoint(experiment_id: str):
+    """Validate experiment outputs and summarize result quality."""
+    try:
+        return validate_experiment_results(experiment_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to validate experiment: {str(e)}")
+
 @app.get("/prompts/export")
 async def export_system_prompts():
     from utils.export_prompts import export_prompts

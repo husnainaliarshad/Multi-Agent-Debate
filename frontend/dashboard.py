@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 # API base URL
-API_BASE = "http://localhost:8000"
+API_BASE = "http://localhost:8001"
 
 def display_event(event: Dict[str, Any], event_index: int = 0):
     """Display a single event with appropriate styling."""
@@ -47,6 +47,18 @@ def display_event(event: Dict[str, Any], event_index: int = 0):
         proposer_id = data.get("proposer_id", 1)
         st.info(f"✅ Proposer {proposer_id} found relevant evidence.")
         with st.expander(f"View Search Results (Proposer {proposer_id})"):
+            st.text(data.get("results", ""))
+    elif event_type == "RETRIEVAL_START":
+        proposer_id = data.get("proposer_id")
+        if proposer_id:
+            st.warning(f"LegalBench retrieval started for proposer {proposer_id}.")
+        else:
+            st.warning("LegalBench retrieval started.")
+    elif event_type == "RETRIEVAL_COMPLETE":
+        proposer_id = data.get("proposer_id")
+        label = f"Proposer {proposer_id}" if proposer_id else "Shared Retrieval"
+        st.info(f"{label} received LegalBench evidence.")
+        with st.expander(f"View LegalBench Retrieval ({label})"):
             st.text(data.get("results", ""))
     elif event_type == "CRITIC_START":
         round_num = data.get("round", 1)
@@ -296,11 +308,27 @@ with col_config:
             exp_rounds = st.slider("Rounds per Debate", 1, 5, 2)
             exp_repeats = st.slider("Repeats per Config", 1, 5, 1)
         with col_exp2:
-            exp_use_search = st.checkbox("Enable Search", value=True, key="exp_search")
-            exp_use_rag = st.checkbox("Enable LegalBench RAG", value=True, key="exp_rag")
+            exp_pilot_mode = st.checkbox("Pilot Mode", value=True, help="Run a small subset first: first 2 topics, 1 repeat, 1 round")
+            exp_validate_after = st.checkbox("Validate Results After Run", value=True, help="Check generated outputs for missing metadata, duplicates, and mode mismatches")
             
         st.markdown("#### 🤖 Model Backbone (for SLM profiles)")
         selected_models = st.multiselect("Select SLM models to use", available_models, default=[available_models[0]] if available_models else [])
+        
+        st.markdown("#### Baseline Configuration")
+        baseline_provider_ui = st.selectbox(
+            "Baseline Provider",
+            provider_options,
+            index=1 if "Groq (Cloud)" in provider_options else 0,
+            key="baseline_provider_ui"
+        )
+        baseline_provider = "openai" if baseline_provider_ui == "LM Studio (Local)" else "groq"
+        baseline_model_options = groq_models if baseline_provider == "groq" and groq_models else available_models
+        baseline_model = st.selectbox(
+            "Baseline Model",
+            baseline_model_options if baseline_model_options else ["liquid/lfm2.5-1.2b"],
+            index=0,
+            key="baseline_model"
+        )
         
         st.markdown("#### ⚖️ Research Configuration Profiles")
         research_profiles = st.multiselect("Select Profiles to Benchmark", [
@@ -311,6 +339,14 @@ with col_config:
             "SLM MAD (Hybrid / Proposed)"
         ], default=["Baseline (Single 70B Model)", "SLM MAD (Hybrid / Proposed)"])
         
+        effective_topics = exp_topics[:2] if exp_pilot_mode else exp_topics
+        effective_rounds = 1 if exp_pilot_mode else exp_rounds
+        effective_repeats = 1 if exp_pilot_mode else exp_repeats
+        slm_profile_count = len([p for p in research_profiles if "Baseline" not in p])
+        matrix_config_count = (1 if any("Baseline" in p for p in research_profiles) else 0) + (len(selected_models) * slm_profile_count)
+        total_planned_runs = len(effective_topics) * matrix_config_count * effective_repeats
+        st.caption(f"Planned matrix: {len(effective_topics)} topic(s) x {matrix_config_count} config(s) x {effective_repeats} repeat(s) = {total_planned_runs} run(s)")
+        
         if st.button("🚀 Start Research Experiment", type="primary"):
             if not exp_topics or not research_profiles:
                 st.error("Please provide topics and select profiles.")
@@ -320,30 +356,58 @@ with col_config:
                     for profile in research_profiles:
                         if "Baseline" in profile:
                             model_configs.append({
-                                "proposer_model": "llama-3.1-70b-versatile",
-                                "critic_model": "llama-3.1-70b-versatile",
-                                "judge_model": "llama-3.1-70b-versatile",
-                                "provider": "groq",
+                                "proposer_model": baseline_model,
+                                "critic_model": baseline_model,
+                                "judge_model": baseline_model,
+                                "provider": baseline_provider,
                                 "mode": "baseline"
                             })
                         elif "ReAct Only" in profile:
-                            model_configs.append({"mode": "react_only", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+                            for model_name in selected_models:
+                                model_configs.append({
+                                    "mode": "react_only",
+                                    "provider": "openai",
+                                    "proposer_model": model_name,
+                                    "critic_model": model_name,
+                                    "judge_model": model_name
+                                })
                         elif "Naive RAG" in profile:
-                            model_configs.append({"mode": "naive_rag", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+                            for model_name in selected_models:
+                                model_configs.append({
+                                    "mode": "naive_rag",
+                                    "provider": "openai",
+                                    "proposer_model": model_name,
+                                    "critic_model": model_name,
+                                    "judge_model": model_name
+                                })
                         elif "Active RAG" in profile:
-                            model_configs.append({"mode": "active_rag", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+                            for model_name in selected_models:
+                                model_configs.append({
+                                    "mode": "active_rag",
+                                    "provider": "openai",
+                                    "proposer_model": model_name,
+                                    "critic_model": model_name,
+                                    "judge_model": model_name
+                                })
                         elif "Hybrid" in profile:
-                            model_configs.append({"mode": "hybrid", "proposer_model": selected_models[0] if selected_models else "liquid/lfm2.5-1.2b"})
+                            for model_name in selected_models:
+                                model_configs.append({
+                                    "mode": "hybrid",
+                                    "provider": "openai",
+                                    "proposer_model": model_name,
+                                    "critic_model": model_name,
+                                    "judge_model": model_name
+                                })
 
                     try:
                         exp_resp = requests.post(f"{API_BASE}/experiments/run", json={
                             "name": exp_name,
-                            "topics": exp_topics,
+                            "topics": effective_topics,
                             "model_configs": model_configs,
-                            "max_rounds": exp_rounds,
-                            "repeats": exp_repeats,
-                            "use_rag": exp_use_rag,
-                            "use_search": exp_use_search
+                            "max_rounds": effective_rounds,
+                            "repeats": effective_repeats,
+                            "use_rag": False,
+                            "use_search": False
                         })
                         if exp_resp.status_code == 200:
                             st.success(f"✅ Research experiment started! ID: {exp_resp.json()['experiment_id']}")
@@ -377,11 +441,30 @@ with col_config:
                                 st.success("Completed!")
                                 if st.button("📊 View Results Summary", key=f"view_{ex['id']}"):
                                     st.info("Results table feature coming soon! Check backend/data/experiments/ for CSV.")
+                                if exp_validate_after and st.button("Validate Outputs", key=f"validate_{ex['id']}"):
+                                    try:
+                                        validate_resp = requests.get(f"{API_BASE}/experiments/validate/{ex['id']}", timeout=10)
+                                        if validate_resp.status_code == 200:
+                                            validation = validate_resp.json()
+                                            if validation.get("errors"):
+                                                st.error("Validation errors found:")
+                                                for issue in validation["errors"]:
+                                                    st.write(f"- {issue}")
+                                            else:
+                                                st.success("No validation errors found.")
+                                            if validation.get("warnings"):
+                                                st.warning("Validation warnings:")
+                                                for issue in validation["warnings"]:
+                                                    st.write(f"- {issue}")
+                                        else:
+                                            st.error(f"Validation failed: {validate_resp.text}")
+                                    except Exception as e:
+                                        st.error(f"Validation error: {e}")
                             elif ex['status'] == 'running':
                                 st.info("Running...")
                                 st.progress(ex.get('progress', 0))
             else:
-                st.error(f"Error fetching experiments: {list_resp.text}")
+                st.write("No experiment data found yet.")
         except Exception as e:
             st.error(f"Error loading experiment list: {e}")
                                 

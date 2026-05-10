@@ -3,7 +3,7 @@ from langchain.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 from typing_extensions import TypedDict, Annotated
 import operator
-from typing import Literal, Dict, Any
+from typing import Literal, Dict, Any, Optional
 import time
 import json
 import uuid
@@ -134,37 +134,59 @@ class ProposerAgent(DebateAgent):
         self.use_search = use_search
         self.rag_service = rag_service
     
-    def generate_argument(self, topic: str, round_num: int = 1, proposer_id: int = 1) -> Dict[str, Any]:
-        """Generate the initial argument on the topic."""
+    def generate_argument(
+        self,
+        topic: str,
+        round_num: int = 1,
+        proposer_id: int = 1,
+        include_search: bool = False,
+        search_query: Optional[str] = None,
+        include_rag: bool = False,
+        rag_query: Optional[str] = None,
+        extra_context: str = "",
+    ) -> Dict[str, Any]:
+        """Generate an argument on the topic with optional search and retrieval evidence."""
         search_results = ""
-        if self.use_search and round_num == 1:
-            print(f"[{self.role}] Searching for evidence on: {topic}")
-            # Emit event for tool use visibility
-            self._emit_event("SEARCH_START", {"proposer_id": proposer_id, "topic": topic})
+        if include_search and search_query:
+            print(f"[{self.role}] Searching for evidence on: {search_query}")
+            self._emit_event("SEARCH_START", {"proposer_id": proposer_id, "topic": topic, "query": search_query})
             
-            # Improved query for better results
-            search_query = f"{topic} facts evidence scientific consensus"
             search_results = search_tool.run(search_query)
             
-            self._emit_event("SEARCH_COMPLETE", {"proposer_id": proposer_id, "results": search_results})
+            self._emit_event(
+                "SEARCH_COMPLETE",
+                {"proposer_id": proposer_id, "query": search_query, "results": search_results, "evidence_type": "web"},
+            )
             print(f"[{self.role}] Search results obtained: {len(search_results)} chars")
         
+        rag_results = ""
+        if include_rag and self.rag_service and rag_query:
+            print(f"[{self.role}] Querying LegalBench RAG for: {rag_query}")
+            self._emit_event("RETRIEVAL_START", {"proposer_id": proposer_id, "query": rag_query})
+            rag_results = self.rag_service.query(rag_query)
+            if rag_results:
+                self._emit_event(
+                    "RETRIEVAL_COMPLETE",
+                    {"proposer_id": proposer_id, "query": rag_query, "results": f"RAG Results:\n{rag_results}", "evidence_type": "rag"},
+                )
+
         prompt = f"Topic: {topic}\n\n"
+        if extra_context:
+            prompt += f"{extra_context.strip()}\n\n"
+
         if search_results:
             prompt += f"Background Information/Search Results:\n{search_results}\n\n"
             prompt += "CRITICAL: You MUST incorporate the facts and evidence from the search results above into your argument. Cite specific details.\n\n"
         
-        # Add RAG results if enabled
-        if self.rag_service:
-            print(f"[{self.role}] Querying LegalBench RAG for: {topic}")
-            rag_results = self.rag_service.query(topic)
-            if rag_results:
-                prompt += f"LegalBench Reference Information:\n{rag_results}\n\n"
-                prompt += "CRITICAL: You MUST incorporate relevant legal principles or case details from the LegalBench references above.\n\n"
-                self._emit_event("SEARCH_COMPLETE", {"proposer_id": proposer_id, "results": f"RAG Results:\n{rag_results}"})
+        if rag_results:
+            prompt += f"LegalBench Reference Information:\n{rag_results}\n\n"
+            prompt += "CRITICAL: You MUST incorporate relevant legal principles or case details from the LegalBench references above.\n\n"
         
         prompt += "Generate your argument."
-        return self.invoke(prompt, self.system_prompt)
+        result = self.invoke(prompt, self.system_prompt)
+        result["search_results"] = search_results
+        result["rag_results"] = rag_results
+        return result
 
 
 class CriticAgent(DebateAgent):
@@ -175,14 +197,20 @@ class CriticAgent(DebateAgent):
         self.system_prompt = config.system_prompt or DEFAULT_CRITIC_PROMPT
         self.use_search = use_search
     
-    def critique(self, proposer_argument: str, topic: str = "", round_num: int = 1) -> Dict[str, Any]:
+    def critique(
+        self,
+        proposer_argument: str,
+        topic: str = "",
+        round_num: int = 1,
+        include_search: bool = False,
+        search_query: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Critique the proposer's argument."""
         search_results = ""
-        if self.use_search:
-            search_query = f"counter arguments and critiques for: {topic}"
+        if include_search and search_query:
             self._emit_event("SEARCH_START", {"role": "critic", "topic": topic, "query": search_query})
             search_results = search_tool.run(search_query)
-            self._emit_event("SEARCH_COMPLETE", {"role": "critic", "results": search_results})
+            self._emit_event("SEARCH_COMPLETE", {"role": "critic", "query": search_query, "results": search_results, "evidence_type": "web"})
 
         prompt = ""
         if search_results:
@@ -190,7 +218,9 @@ class CriticAgent(DebateAgent):
             prompt += "Use the research above to find specific weaknesses or overlooked facts.\n\n"
             
         prompt += f"Proposer's Argument:\n{proposer_argument}\n\nProvide your critique."
-        return self.invoke(prompt, self.system_prompt)
+        result = self.invoke(prompt, self.system_prompt)
+        result["search_results"] = search_results
+        return result
 
 
 class JudgeAgent(DebateAgent):
@@ -223,22 +253,24 @@ class DebateOrchestrator:
         self.use_summary_relay = use_summary_relay
         self.use_rag = use_rag
         self.mode = config.mode if hasattr(config, 'mode') else "hybrid"
+        self.mode_capabilities = self._resolve_mode_capabilities()
         self.use_stability = True
         self.stability_monitor = StabilityMonitor()
         
-        # Use provided RAG service or initialize only if requested and not provided
-        self.rag_service = rag_service if rag_service else (RAGService() if use_rag else None)
+        # Initialize retrieval whenever the selected mode requires LegalBench support.
+        requires_rag = self.mode_capabilities["shared_initial_rag"] or self.mode_capabilities["iterative_rag"] or use_rag
+        self.rag_service = rag_service if rag_service else (RAGService() if requires_rag else None)
         
         # Fresh model initialization for each agent to flush context
         if proposer_configs:
-            self.proposers = [ProposerAgent(cfg, config, max_tokens, use_search=use_search, rag_service=self.rag_service) for cfg in proposer_configs]
+            self.proposers = [ProposerAgent(cfg, config, max_tokens, use_search=False, rag_service=self.rag_service) for cfg in proposer_configs]
         else:
-            self.proposers = [ProposerAgent(config.proposer, config, max_tokens, use_search=use_search, rag_service=self.rag_service)]
+            self.proposers = [ProposerAgent(config.proposer, config, max_tokens, use_search=False, rag_service=self.rag_service)]
         
         for p in self.proposers:
             p.set_event_callback(self._emit_event)
             
-        self.critic = CriticAgent(config.critic, config, max_tokens, use_search=use_search)
+        self.critic = CriticAgent(config.critic, config, max_tokens, use_search=False)
         self.critic.set_event_callback(self._emit_event)
         
         self.judge = JudgeAgent(config.judge, config, max_tokens)
@@ -248,6 +280,84 @@ class DebateOrchestrator:
         
         # Initialize evaluation metrics
         self.metrics = DebateMetrics()
+
+    def _resolve_mode_capabilities(self) -> Dict[str, Any]:
+        if self.mode == "baseline":
+            return {
+                "single_agent": True,
+                "proposer_search": False,
+                "critic_search": False,
+                "shared_initial_rag": False,
+                "iterative_rag": False,
+            }
+        if self.mode == "react_only":
+            return {
+                "single_agent": False,
+                "proposer_search": True,
+                "critic_search": True,
+                "shared_initial_rag": False,
+                "iterative_rag": False,
+            }
+        if self.mode == "naive_rag":
+            return {
+                "single_agent": False,
+                "proposer_search": False,
+                "critic_search": False,
+                "shared_initial_rag": True,
+                "iterative_rag": False,
+            }
+        if self.mode == "active_rag":
+            return {
+                "single_agent": False,
+                "proposer_search": False,
+                "critic_search": False,
+                "shared_initial_rag": False,
+                "iterative_rag": True,
+            }
+
+        return {
+            "single_agent": False,
+            "proposer_search": self.use_search,
+            "critic_search": self.use_search,
+            "shared_initial_rag": False,
+            "iterative_rag": self.use_rag,
+        }
+
+    def _prepare_shared_rag_context(self, topic: str) -> str:
+        if not self.mode_capabilities["shared_initial_rag"] or not self.rag_service:
+            return ""
+
+        self._emit_event("RETRIEVAL_START", {"role": "shared", "query": topic, "mode": self.mode})
+        context = self.rag_service.query(topic)
+        if context:
+            self._emit_event(
+                "RETRIEVAL_COMPLETE",
+                {"role": "shared", "query": topic, "results": f"RAG Results:\n{context}", "mode": self.mode},
+            )
+            return f"Shared LegalBench Context:\n{context}"
+        return ""
+
+    def _build_proposer_search_query(self, topic: str, round_num: int, previous_critique: str = "") -> Optional[str]:
+        if not self.mode_capabilities["proposer_search"]:
+            return None
+        if round_num == 1:
+            return f"{topic} legal analysis facts evidence precedent"
+        critique_snippet = previous_critique[:240]
+        return f"{topic} address critique with legal evidence and counterpoints {critique_snippet}"
+
+    def _build_proposer_rag_query(self, topic: str, round_num: int, previous_critique: str = "") -> Optional[str]:
+        if not self.mode_capabilities["iterative_rag"] or not self.rag_service:
+            return None
+        if round_num == 1:
+            return topic
+        critique_snippet = previous_critique[:320]
+        return f"{topic}\n\nNeed legal support to address this critique:\n{critique_snippet}"
+
+    def _build_critic_search_query(self, topic: str, proposer_argument: str) -> Optional[str]:
+        if not self.mode_capabilities["critic_search"]:
+            return None
+        argument_snippet = proposer_argument[:260]
+        return f"counter arguments and critiques for: {topic}. Focus on weaknesses in: {argument_snippet}"
 
 
 
@@ -266,14 +376,18 @@ class DebateOrchestrator:
             print(f"[{self.session_id}] Starting debate on topic: {topic}")
             # Emit first event with topic immediately for persistence visibility
             self._emit_event("DEBATE_START", {"topic": topic})
+            self._emit_event("MODE_SELECTED", {"mode": self.mode, **self.mode_capabilities})
             
             print(f"[{self.session_id}] Number of proposers: {len(self.proposers)}, Rounds: {self.num_rounds}")
+            base_topic = topic
+            shared_rag_context = self._prepare_shared_rag_context(base_topic)
             
             # Store all proposer arguments, critic critiques, and search results across rounds
             all_proposer_arguments = []  # List of lists: [[round1_args], [round2_args], ...]
             all_critic_critiques = []     # List of lists: [[round1_critiques], [round2_critiques], ...]
             all_search_results = []       # List of lists: [[round1_search], [round2_search], ...]
             self.round_summaries = []     # List of dicts for summary relay
+            baseline_judge_input = ""
             
             for round_num in range(1, self.num_rounds + 1):
                 print(f"[{self.session_id}] Round {round_num}/{self.num_rounds}")
@@ -282,18 +396,28 @@ class DebateOrchestrator:
                 # RESEARCH MODE: Baseline (Single Agent, No Debate)
                 if self.mode == "baseline":
                     print(f"[{self.session_id}] Mode: Baseline (Single Agent)")
-                    res = self.proposers[0].generate_argument(topic, round_num=1)
+                    res = self.proposers[0].generate_argument(
+                        base_topic,
+                        round_num=1,
+                        proposer_id=1,
+                        include_search=False,
+                        include_rag=False,
+                    )
                     all_proposer_arguments.append([res["content"]])
-                    # In baseline, we go straight to judging the single response
-                    debate_summary = f"Topic: {topic}\n\nModel Response:\n{res['content']}"
-                    break # Exit round loop
-                
-                # RESEARCH MODE: Naive RAG (Pre-retrieve once)
-                if self.mode == "naive_rag" and round_num == 1:
-                    print(f"[{self.session_id}] Mode: Naive RAG")
-                    # Pre-retrieve context for all agents
-                    context = self.rag_service.query(topic) if self.rag_service else ""
-                    topic = f"{topic}\n\nCONTEXT FROM LEGALBENCH:\n{context}"
+                    if self.use_info_gain:
+                        self.metrics.add_proposer_response(res["content"])
+                    self.metrics.format_adherence["total"] += 1
+                    if res.get("syntactic_valid", False):
+                        self.metrics.format_adherence["valid"] += 1
+                    self._emit_event("PROPOSER_FINAL", {
+                        "proposer_id": 1,
+                        "round": 1,
+                        "response": res["content"],
+                        "latency": res["latency"],
+                        "syntactic_valid": res["syntactic_valid"]
+                    })
+                    baseline_judge_input = f"Topic: {base_topic}\n\nModel Response:\n{res['content']}"
+                    break
                 
                 # All proposers generate arguments in parallel
                 round_proposer_results = []
@@ -304,7 +428,8 @@ class DebateOrchestrator:
                     self._emit_event("PROPOSER_THOUGHT", {"proposer_id": i+1, "round": round_num, "thought": "Analyzing topic and constructing argument..."})
                     
                     if round_num == 1:
-                        result = proposer.generate_argument(topic, round_num=round_num, proposer_id=i+1)
+                        round_topic = base_topic
+                        previous_critique = ""
                     else:
                         # In later rounds, respond to previous critique and don't repeat yourself
                         if self.use_summary_relay and round_num > 1 and len(self.round_summaries) >= round_num - 1:
@@ -314,37 +439,43 @@ class DebateOrchestrator:
                             previous_critique = "\n\n".join(all_critic_critiques[round_num-2])
                             previous_argument = all_proposer_arguments[round_num-2][i]
                             
-                        result = proposer.generate_argument(
-                            f"Topic: {topic}\n\n"
+                        round_topic = (
+                            f"Topic: {base_topic}\n\n"
                             f"Your Previous Argument:\n{previous_argument}\n\n"
                             f"Critic's Critique:\n{previous_critique}\n\n"
                             f"IMPORTANT: Do not repeat your previous points. Respond to the critique, "
                             f"address the weaknesses identified, and provide new supporting evidence or "
-                            f"refined reasoning. Build upon your previous argument rather than restating it.",
-                            round_num=round_num,
-                            proposer_id=i+1
+                            f"refined reasoning. Build upon your previous argument rather than restating it."
                         )
+
+                    result = proposer.generate_argument(
+                        round_topic,
+                        round_num=round_num,
+                        proposer_id=i+1,
+                        include_search=bool(self._build_proposer_search_query(base_topic, round_num, previous_critique)),
+                        search_query=self._build_proposer_search_query(base_topic, round_num, previous_critique),
+                        include_rag=bool(self._build_proposer_rag_query(base_topic, round_num, previous_critique)),
+                        rag_query=self._build_proposer_rag_query(base_topic, round_num, previous_critique),
+                        extra_context=shared_rag_context,
+                    )
                     
                     # Authorship Obfuscation (Simple perturbation for SPB mitigation)
                     result["content"] = self._obfuscate_authorship(result["content"])
                     
                     round_proposer_results.append(result)
                     
-                    # Capture search results from events for this proposer/round
-                    search_content = ""
-                    for event in reversed(self.events):
-                        if event["event_type"] == "SEARCH_COMPLETE" and \
-                           event["data"].get("proposer_id") == i+1:
-                            search_content = event["data"].get("results", "")
-                            self.metrics.search_efficiency["total_searches"] += 1
-                            if not search_content or len(search_content.strip()) < 20:
-                                self.metrics.search_efficiency["empty_searches"] += 1
-                            break
-                    round_search_results.append(search_content)
+                    search_content = result.get("search_results", "")
+                    rag_content = result.get("rag_results", "")
+                    combined_evidence = "\n\n".join([content for content in [search_content, rag_content] if content])
+                    if search_content:
+                        self.metrics.search_efficiency["total_searches"] += 1
+                        if len(search_content.strip()) < 20:
+                            self.metrics.search_efficiency["empty_searches"] += 1
+                    round_search_results.append(combined_evidence)
                     
                     # Track Faithfulness
-                    if self.use_faithfulness and search_content:
-                        faithfulness_score = calculate_turn_faithfulness(result["content"], search_content)
+                    if self.use_faithfulness and combined_evidence:
+                        faithfulness_score = calculate_turn_faithfulness(result["content"], combined_evidence)
                         self.metrics.turn_faithfulness.append(faithfulness_score)
 
                     # Track Format Adherence
@@ -383,23 +514,27 @@ class DebateOrchestrator:
                 if self.use_summary_relay and round_num > 1 and len(self.round_summaries) >= round_num - 1:
                     combined_args = "\n\n".join([f"Proposer {idx+1} (Summary): {arg}" for idx, arg in enumerate(self.round_summaries[round_num-2]['proposer'])])
                 else:
-                    combined_args = "\n\n".join([f"Proposer {idx+1}: {arg}" for idx, arg in enumerate(round_proposer_results)])
+                    combined_args = "\n\n".join([f"Proposer {idx+1}: {arg['content']}" for idx, arg in enumerate(round_proposer_results)])
                     
-                critic_result = self.critic.critique(combined_args, topic=topic, round_num=round_num)
+                critic_search_query = self._build_critic_search_query(base_topic, combined_args)
+                critic_result = self.critic.critique(
+                    combined_args,
+                    topic=base_topic,
+                    round_num=round_num,
+                    include_search=bool(critic_search_query),
+                    search_query=critic_search_query,
+                )
                 
                 # Format adherence tracking
                 self.metrics.format_adherence["total"] += 1
                 if critic_result.get("syntactic_valid", False):
                     self.metrics.format_adherence["valid"] += 1
                     
-                # Track critic search efficiency
-                for event in reversed(self.events):
-                    if event["event_type"] == "SEARCH_COMPLETE" and event["data"].get("role") == "critic":
-                        critic_search = event["data"].get("results", "")
-                        self.metrics.search_efficiency["total_searches"] += 1
-                        if not critic_search or len(critic_search.strip()) < 20:
-                            self.metrics.search_efficiency["empty_searches"] += 1
-                        break
+                critic_search = critic_result.get("search_results", "")
+                if critic_search:
+                    self.metrics.search_efficiency["total_searches"] += 1
+                    if len(critic_search.strip()) < 20:
+                        self.metrics.search_efficiency["empty_searches"] += 1
                 
                 all_critic_critiques.append([critic_result["content"]])
                 self._emit_event("CRITIC_FINAL", {
@@ -432,12 +567,15 @@ class DebateOrchestrator:
             print(f"[{self.session_id}] Judge synthesizing debate...")
             self._emit_event("JUDGE_START", {})
             
-            debate_summary = ""
-            for round_num, (args, critique) in enumerate(zip(all_proposer_arguments, all_critic_critiques), 1):
-                debate_summary += f"\n=== Round {round_num} ===\n"
-                for i, arg in enumerate(args):
-                    debate_summary += f"\nProposer {i+1}:\n{arg}\n"
-                debate_summary += f"\nCritic:\n{critique}\n"
+            if self.mode == "baseline":
+                debate_summary = baseline_judge_input
+            else:
+                debate_summary = ""
+                for round_num, (args, critique) in enumerate(zip(all_proposer_arguments, all_critic_critiques), 1):
+                    debate_summary += f"\n=== Round {round_num} ===\n"
+                    for i, arg in enumerate(args):
+                        debate_summary += f"\nProposer {i+1}:\n{arg}\n"
+                    debate_summary += f"\nCritic:\n{critique}\n"
             
             # Position Swapping: Run judge twice with swapped argument order if enabled
             if self.use_position_swap:
@@ -452,12 +590,15 @@ class DebateOrchestrator:
                 verdict_normal = self._extract_verdict(judge_result_normal["content"])
                 
                 # Second run: swapped order (Critic then Proposer)
-                debate_summary_swapped = ""
-                for round_num, (args, critique) in enumerate(zip(all_proposer_arguments, all_critic_critiques), 1):
-                    debate_summary_swapped += f"\n=== Round {round_num} ===\n"
-                    debate_summary_swapped += f"\nCritic:\n{critique}\n"
-                    for i, arg in enumerate(args):
-                        debate_summary_swapped += f"\nProposer {i+1}:\n{arg}\n"
+                if self.mode == "baseline":
+                    debate_summary_swapped = debate_summary
+                else:
+                    debate_summary_swapped = ""
+                    for round_num, (args, critique) in enumerate(zip(all_proposer_arguments, all_critic_critiques), 1):
+                        debate_summary_swapped += f"\n=== Round {round_num} ===\n"
+                        debate_summary_swapped += f"\nCritic:\n{critique}\n"
+                        for i, arg in enumerate(args):
+                            debate_summary_swapped += f"\nProposer {i+1}:\n{arg}\n"
                 
                 judge_result_swapped = self.judge.judge(debate_summary_swapped, "")
                 consensus_swapped = self._extract_consensus_score(judge_result_swapped["content"])
@@ -514,6 +655,11 @@ class DebateOrchestrator:
             
             result = {
                 "session_id": self.session_id,
+                "topic": base_topic,
+                "mode": self.mode,
+                "provider": self.config.model_provider,
+                "use_search": self.mode_capabilities["proposer_search"] or self.mode_capabilities["critic_search"],
+                "use_rag": self.mode_capabilities["shared_initial_rag"] or self.mode_capabilities["iterative_rag"],
                 "proposer_responses": all_proposer_arguments,
                 "critic_responses": all_critic_critiques,
                 "search_results": all_search_results,

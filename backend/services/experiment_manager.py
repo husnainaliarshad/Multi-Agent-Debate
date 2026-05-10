@@ -1,14 +1,14 @@
 import threading
-import uuid
 import time
-import os
-import json
-from typing import Dict, Any, List
+import uuid
+from typing import Any, Dict, List
+
 from services.batch_runner import BatchRunner
+
 
 class ExperimentManager:
     _instance = None
-    
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(ExperimentManager, cls).__new__(cls)
@@ -25,15 +25,15 @@ class ExperimentManager:
             "progress": 0,
             "total_runs": self._calculate_total_runs(config),
             "completed_runs": 0,
+            "succeeded_runs": 0,
+            "failed_runs": 0,
             "results_path": None,
             "start_time": time.time(),
-            "config": config
+            "config": config,
         }
-        
-        # Run in background thread
-        thread = threading.Thread(target=self._run_experiment_thread, args=(experiment_id, config))
+
+        thread = threading.Thread(target=self._run_experiment_thread, args=(experiment_id, config), daemon=True)
         thread.start()
-        
         return experiment_id
 
     def _calculate_total_runs(self, config: Dict[str, Any]) -> int:
@@ -46,26 +46,39 @@ class ExperimentManager:
         try:
             exp = self.experiments[experiment_id]
             exp["status"] = "running"
-            
-            runner = BatchRunner(experiment_id)
-            
-            # We wrap the runner.run_experiment logic to update progress
-            # For simplicity, we'll let BatchRunner handle the core but maybe add a callback?
-            # Let's just update periodically by checking the results.csv or similar
-            
-            # For now, let's just run it
+
+            runner = BatchRunner(
+                experiment_id,
+                progress_callback=lambda update: self._handle_progress(experiment_id, update),
+            )
             results_file = runner.run_experiment(config)
-            
+
             exp["status"] = "completed"
             exp["progress"] = 100
             exp["results_path"] = results_file
             exp["end_time"] = time.time()
-            
-        except Exception as e:
-            print(f"Error in experiment {experiment_id}: {e}")
+            exp["completed_runs"] = len(runner.runs)
+            exp["succeeded_runs"] = sum(1 for run in runner.runs if run.get("status") == "completed")
+            exp["failed_runs"] = sum(1 for run in runner.runs if run.get("status") == "failed")
+        except Exception as exc:
+            print(f"Error in experiment {experiment_id}: {exc}")
             if experiment_id in self.experiments:
                 self.experiments[experiment_id]["status"] = "failed"
-                self.experiments[experiment_id]["error"] = str(e)
+                self.experiments[experiment_id]["error"] = str(exc)
+
+    def _handle_progress(self, experiment_id: str, update: Dict[str, Any]):
+        exp = self.experiments.get(experiment_id)
+        if not exp:
+            return
+
+        total_runs = max(update.get("total_runs", 0), 1)
+        completed_runs = update.get("run_index", 0)
+        exp["completed_runs"] = completed_runs
+        exp["succeeded_runs"] = update.get("succeeded_runs", exp.get("succeeded_runs", 0))
+        exp["failed_runs"] = update.get("failed_runs", exp.get("failed_runs", 0))
+        exp["progress"] = int((completed_runs / total_runs) * 100)
+        exp["results_path"] = update.get("results_path", exp.get("results_path"))
+        exp["last_topic"] = update.get("last_topic")
 
     def get_status(self, experiment_id: str) -> Dict[str, Any]:
         return self.experiments.get(experiment_id, {"status": "not_found"})
@@ -73,5 +86,5 @@ class ExperimentManager:
     def list_experiments(self) -> List[Dict[str, Any]]:
         return list(self.experiments.values())
 
-# Global manager instance
+
 experiment_manager = ExperimentManager()
