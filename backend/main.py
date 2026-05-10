@@ -14,6 +14,7 @@ from services.experiment_manager import experiment_manager
 from services.rag_service import RAGService
 from services.experiment_validator import validate_experiment_results
 from services.legalbench_benchmark import legalbench_benchmark_manager
+from services.report_compiler import report_compiler_service
 
 # Load environment variables
 load_dotenv()
@@ -324,6 +325,11 @@ class LegalBenchBenchmarkRunRequest(BaseModel):
     limit_per_benchmark: Optional[int] = None
     n_results: Optional[int] = 5
 
+class ReportCompileRequest(BaseModel):
+    name: Optional[str] = "Final Report Summary"
+    experiment_ids: Optional[List[str]] = None
+    benchmark_run_ids: Optional[List[str]] = None
+
 @app.post("/experiments/run")
 def run_experiment_endpoint(request: ExperimentInitRequest):
     """Start a batch experiment."""
@@ -383,6 +389,23 @@ def get_legalbench_benchmark_status_endpoint(run_id: str):
 def list_legalbench_benchmark_runs_endpoint():
     """List LegalBench retrieval benchmark runs started in this process."""
     return {"runs": legalbench_benchmark_manager.list_runs()}
+
+@app.get("/reports/sources")
+def list_report_sources_endpoint():
+    """List completed experiment and benchmark outputs that can feed a final report."""
+    try:
+        return report_compiler_service.list_available_sources()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list report sources: {str(e)}")
+
+@app.post("/reports/compile")
+def compile_report_endpoint(request: ReportCompileRequest):
+    """Compile report-ready debate and benchmark summary tables."""
+    try:
+        report = report_compiler_service.compile_report(request.dict())
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to compile report: {str(e)}")
 
 @app.get("/prompts/export")
 async def export_system_prompts():
