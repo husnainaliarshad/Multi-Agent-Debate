@@ -176,13 +176,13 @@ class ProposerAgent(DebateAgent):
 
         if search_results:
             prompt += f"Background Information/Search Results:\n{search_results}\n\n"
-            prompt += "CRITICAL: You MUST incorporate the facts and evidence from the search results above into your argument. Cite specific details.\n\n"
+            prompt += "CRITICAL: Your argument MUST reference at least 2 specific facts/evidence from search results above. Format as [Source: fact].\n\n"
         
         if rag_results:
             prompt += f"LegalBench Reference Information:\n{rag_results}\n\n"
-            prompt += "CRITICAL: You MUST incorporate relevant legal principles or case details from the LegalBench references above.\n\n"
+            prompt += "CRITICAL: Your argument MUST reference at least 1 legal principle/case from LegalBench above. Format as [LegalRef: principle].\n\n"
         
-        prompt += "Generate your argument."
+        prompt += "Generate your argument with required citations."
         result = self.invoke(prompt, self.system_prompt)
         result["search_results"] = search_results
         result["rag_results"] = rag_results
@@ -204,6 +204,7 @@ class CriticAgent(DebateAgent):
         round_num: int = 1,
         include_search: bool = False,
         search_query: Optional[str] = None,
+        prompt_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Critique the proposer's argument."""
         search_results = ""
@@ -216,7 +217,10 @@ class CriticAgent(DebateAgent):
         if search_results:
             prompt += f"Background Research on Counter-Arguments:\n{search_results}\n\n"
             prompt += "Use the research above to find specific weaknesses or overlooked facts.\n\n"
-            
+
+        if prompt_override:
+            prompt += prompt_override + "\n\n"
+
         prompt += f"Proposer's Argument:\n{proposer_argument}\n\nProvide your critique."
         result = self.invoke(prompt, self.system_prompt)
         result["search_results"] = search_results
@@ -242,7 +246,7 @@ class JudgeAgent(DebateAgent):
 class DebateOrchestrator:
     """Orchestrates the multi-agent debate."""
     
-    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False, use_position_swap: bool = True, use_info_gain: bool = True, use_faithfulness: bool = True, use_summary_relay: bool = True, use_rag: bool = False, rag_service: RAGService = None):
+    def __init__(self, config: DebateConfig, max_tokens: int = 500, proposer_configs: list = None, num_rounds: int = 1, use_search: bool = False, use_position_swap: bool = True, use_info_gain: bool = True, use_faithfulness: bool = True, use_summary_relay: bool = True, use_rag: bool = False, rag_service: RAGService = None, force_different_proposers: bool = False, force_different_rounds: bool = False, critic_repetition_check: bool = False, negative_constraints: bool = False, round_specific_topics: bool = False, temperature_annealing: bool = False, judge_intervention: bool = False, perspective_rotation: bool = False, contradiction_detection: bool = False, early_termination_loop: bool = False):
         self.config = config
         self.max_tokens = max_tokens
         self.num_rounds = num_rounds
@@ -252,14 +256,29 @@ class DebateOrchestrator:
         self.use_faithfulness = use_faithfulness
         self.use_summary_relay = use_summary_relay
         self.use_rag = use_rag
+        self.force_different_proposers = force_different_proposers
+        self.force_different_rounds = force_different_rounds
+        self.critic_repetition_check = critic_repetition_check
+        self.negative_constraints = negative_constraints
+        self.round_specific_topics = round_specific_topics
+        self.temperature_annealing = temperature_annealing
+        self.judge_intervention = judge_intervention
+        self.perspective_rotation = perspective_rotation
+        self.contradiction_detection = contradiction_detection
+        self.early_termination_loop = early_termination_loop
         self.mode = config.mode if hasattr(config, 'mode') else "hybrid"
         self.mode_capabilities = self._resolve_mode_capabilities()
         self.use_stability = True
         self.stability_monitor = StabilityMonitor()
         
-        # Initialize retrieval whenever the selected mode requires LegalBench support.
-        requires_rag = self.mode_capabilities["shared_initial_rag"] or self.mode_capabilities["iterative_rag"] or use_rag
-        self.rag_service = rag_service if rag_service else (RAGService() if requires_rag else None)
+        # LegalBench RAG only when use_rag is enabled; ignore injected services otherwise (e.g. API shared client).
+        if not use_rag:
+            self.rag_service = None
+        else:
+            requires_rag = (
+                self.mode_capabilities["shared_initial_rag"] or self.mode_capabilities["iterative_rag"]
+            )
+            self.rag_service = rag_service if rag_service else (RAGService() if requires_rag else None)
         
         # Fresh model initialization for each agent to flush context
         if proposer_configs:
@@ -388,11 +407,31 @@ class DebateOrchestrator:
             all_search_results = []       # List of lists: [[round1_search], [round2_search], ...]
             self.round_summaries = []     # List of dicts for summary relay
             baseline_judge_input = ""
+
+            # Track points made for negative constraints
+            all_points_made = set()  # Set of unique points to avoid repetition
             
             for round_num in range(1, self.num_rounds + 1):
                 print(f"[{self.session_id}] Round {round_num}/{self.num_rounds}")
                 self._emit_event("ROUND_START", {"round": round_num, "total_rounds": self.num_rounds})
-                
+
+                # Round-specific topic focus
+                round_topic_focus = ""
+                if self.round_specific_topics:
+                    round_focuses = [
+                        "legal principles",
+                        "factual evidence",
+                        "public policy",
+                        "ethical considerations",
+                        "economic consequences"
+                    ]
+                    round_topic_focus = f"\n\nFOCUS: {round_focuses[(round_num-1) % len(round_focuses)]}."
+
+                # Temperature annealing: increase temperature in later rounds
+                round_temperature_boost = 0.0
+                if self.temperature_annealing and round_num > 1:
+                    round_temperature_boost = (round_num - 1) * 0.1  # +0.1 per round
+
                 # RESEARCH MODE: Baseline (Single Agent, No Debate)
                 if self.mode == "baseline":
                     print(f"[{self.session_id}] Mode: Baseline (Single Agent)")
@@ -422,13 +461,42 @@ class DebateOrchestrator:
                 # All proposers generate arguments in parallel
                 round_proposer_results = []
                 round_search_results = []
+
+                # Define unique perspectives for proposer diversity
+                proposer_perspectives = [
+                    "pro-plaintiff perspective (favor the plaintiff's position)",
+                    "pro-defendant perspective (favor the defendant's position)",
+                    "neutral balanced perspective (weigh both sides equally)",
+                    "public policy perspective (consider broader societal implications)",
+                    "economic perspective (focus on costs, benefits, incentives)",
+                    "constitutional rights perspective (prioritize individual rights)",
+                ]
+
                 for i, proposer in enumerate(self.proposers):
                     print(f"[{self.session_id}] Proposer {i+1} generating argument...")
                     self._emit_event("PROPOSER_START", {"proposer_id": i+1, "round": round_num, "topic": topic})
                     self._emit_event("PROPOSER_THOUGHT", {"proposer_id": i+1, "round": round_num, "thought": "Analyzing topic and constructing argument..."})
-                    
+
+                    # Build anti-loop instructions
+                    anti_loop_context = ""
+
+                    # Perspective diversity (fixed perspective per proposer)
+                    if self.force_different_proposers and len(self.proposers) > 1:
+                        perspective = proposer_perspectives[i % len(proposer_perspectives)]
+                        anti_loop_context += f"\n\nPROPOSER {i+1}: Adopt {perspective} viewpoint. Differentiate from others.\n"
+
+                    # Perspective rotation (switch perspectives each round)
+                    if self.perspective_rotation and round_num > 1:
+                        rotated_perspective = proposer_perspectives[(i + round_num - 1) % len(proposer_perspectives)]
+                        anti_loop_context += f"\n\nROTATE: Adopt {rotated_perspective} perspective.\n"
+
+                    # Negative constraints (list points to avoid)
+                    if self.negative_constraints and all_points_made:
+                        points_list = "\n- ".join(list(all_points_made)[:5])  # Limit to top 5 points
+                        anti_loop_context += f"\n\nAVOID: {points_list}\n"
+
                     if round_num == 1:
-                        round_topic = base_topic
+                        round_topic = base_topic + round_topic_focus
                         previous_critique = ""
                     else:
                         # In later rounds, respond to previous critique and don't repeat yourself
@@ -438,14 +506,41 @@ class DebateOrchestrator:
                         else:
                             previous_critique = "\n\n".join(all_critic_critiques[round_num-2])
                             previous_argument = all_proposer_arguments[round_num-2][i]
-                            
+
+                        # Truncate previous context to fit in context window
+                        max_context_length = 1500  # Leave room for system prompt and new content
+                        truncated_previous = previous_argument[:max_context_length] + "..." if len(previous_argument) > max_context_length else previous_argument
+                        truncated_critique = previous_critique[:max_context_length] + "..." if len(previous_critique) > max_context_length else previous_critique
+
                         round_topic = (
                             f"Topic: {base_topic}\n\n"
-                            f"Your Previous Argument:\n{previous_argument}\n\n"
-                            f"Critic's Critique:\n{previous_critique}\n\n"
-                            f"IMPORTANT: Do not repeat your previous points. Respond to the critique, "
-                            f"address the weaknesses identified, and provide new supporting evidence or "
-                            f"refined reasoning. Build upon your previous argument rather than restating it."
+                            f"Your Previous Argument:\n{truncated_previous}\n\n"
+                            f"Critic's Critique:\n{truncated_critique}\n\n"
+                            f"{round_topic_focus}"
+                        )
+
+                        if self.force_different_rounds:
+                            round_topic += (
+                                "CRITICAL: NO repetition. Entirely NEW arguments only. "
+                                "If no new points, acknowledge limitation.\n\n"
+                            )
+                        else:
+                            round_topic += (
+                                "Don't repeat previous points. Address critique with new evidence.\n"
+                            )
+
+                    # Apply temperature annealing if enabled
+                    if self.temperature_annealing:
+                        proposer.config.temperature = min(proposer.config.temperature + round_temperature_boost, 1.0)
+                        # Reinitialize model with new temperature
+                        from langchain.chat_models import init_chat_model
+                        proposer.model = init_chat_model(
+                            proposer.config.model,
+                            model_provider=proposer.debate_config.model_provider,
+                            base_url=proposer.debate_config.base_url if proposer.debate_config.model_provider != "groq" else None,
+                            api_key=proposer.debate_config.api_key if proposer.debate_config.model_provider != "groq" else proposer.debate_config.groq_api_key,
+                            temperature=proposer.config.temperature,
+                            model_kwargs={"max_tokens": self.max_tokens}
                         )
 
                     result = proposer.generate_argument(
@@ -456,12 +551,20 @@ class DebateOrchestrator:
                         search_query=self._build_proposer_search_query(base_topic, round_num, previous_critique),
                         include_rag=bool(self._build_proposer_rag_query(base_topic, round_num, previous_critique)),
                         rag_query=self._build_proposer_rag_query(base_topic, round_num, previous_critique),
-                        extra_context=shared_rag_context,
+                        extra_context=shared_rag_context + anti_loop_context,
                     )
                     
                     # Authorship Obfuscation (Simple perturbation for SPB mitigation)
                     result["content"] = self._obfuscate_authorship(result["content"])
-                    
+
+                    # Extract points for negative constraints (simple keyword extraction)
+                    if self.negative_constraints:
+                        # Simple extraction: split by sentences, take first 3 as "points"
+                        sentences = result["content"].split(". ")
+                        for sent in sentences[:3]:
+                            if len(sent.strip()) > 20:  # Only meaningful sentences
+                                all_points_made.add(sent.strip()[:50])  # Truncate to 50 chars
+
                     round_proposer_results.append(result)
                     
                     search_content = result.get("search_results", "")
@@ -504,6 +607,57 @@ class DebateOrchestrator:
                         print(f"[{self.session_id}] Adaptive Stopping triggered: Opinion stability reached at round {round_num}")
                         self._emit_event("ADAPTIVE_STOPPING", {"round": round_num})
                         break
+
+                # Judge intervention: if judge detects looping, intervene mid-debate
+                if self.judge_intervention and round_num > 1 and round_num < self.num_rounds:
+                    try:
+                        self._emit_event("JUDGE_THOUGHT", {"thought": "Checking for argument repetition..."})
+                        loop_check_prompt = (
+                            f"Review these arguments from Round {round_num} and the previous round. "
+                            f"Are the proposers repeating the same points or arguments? "
+                            f"Previous round arguments:\n{all_proposer_arguments[round_num-2]}\n\n"
+                            f"Current round arguments:\n{[r['content'] for r in round_proposer_results]}\n\n"
+                            f"Respond with 'LOOP_DETECTED' if there is significant repetition, otherwise 'NO_LOOP'."
+                        )
+                        loop_check = self.judge.invoke(loop_check_prompt, "You are a loop detector. Respond only with LOOP_DETECTED or NO_LOOP.")
+                        if "LOOP_DETECTED" in loop_check["content"].upper():
+                            self._emit_event("JUDGE_INTERVENTION", {"round": round_num, "reason": "Repetition detected"})
+                            print(f"[{self.session_id}] Judge intervention triggered at round {round_num}: repetition detected")
+                            # Add intervention message to next round's topic
+                            if round_num < self.num_rounds:
+                                self._emit_event("JUDGE_THOUGHT", {"thought": "Intervening to request new arguments..."})
+                    except Exception as e:
+                        print(f"[{self.session_id}] Judge intervention check failed: {e}")
+
+                # Contradiction detection: check if proposers contradict their previous stances
+                if self.contradiction_detection and round_num > 1:
+                    try:
+                        for i, (prev_arg, curr_arg) in enumerate(zip(all_proposer_arguments[round_num-2], [r["content"] for r in round_proposer_results])):
+                            contradiction_check = self.judge.invoke(
+                                f"Does this argument contradict the previous one?\n\nPrevious: {prev_arg}\n\nCurrent: {curr_arg}\n\nRespond YES or NO.",
+                                "You are a contradiction detector. Respond only with YES or NO."
+                            )
+                            if "YES" in contradiction_check["content"].upper():
+                                self._emit_event("CONTRADICTION_DETECTED", {"proposer_id": i+1, "round": round_num})
+                                print(f"[{self.session_id}] Contradiction detected for Proposer {i+1} in round {round_num}")
+                    except Exception as e:
+                        print(f"[{self.session_id}] Contradiction detection failed: {e}")
+
+                # Early termination with loop report
+                if self.early_termination_loop and round_num > 1:
+                    # Check if arguments are very similar to previous round using simple string similarity
+                    prev_text = " ".join(all_proposer_arguments[round_num-2])
+                    curr_text = " ".join([r["content"] for r in round_proposer_results])
+                    similarity = len(set(prev_text.split()) & set(curr_text.split())) / max(len(set(prev_text.split())), 1)
+                    if similarity > 0.7:  # 70% overlap
+                        self._emit_event("EARLY_TERMINATION", {
+                            "round": round_num,
+                            "reason": "High similarity with previous round",
+                            "similarity": similarity
+                        })
+                        print(f"[{self.session_id}] Early termination at round {round_num}: similarity {similarity:.2f}")
+                        break
+
                 all_search_results.append(round_search_results)
                 
                 # Critic critiques all proposer arguments
@@ -517,12 +671,24 @@ class DebateOrchestrator:
                     combined_args = "\n\n".join([f"Proposer {idx+1}: {arg['content']}" for idx, arg in enumerate(round_proposer_results)])
                     
                 critic_search_query = self._build_critic_search_query(base_topic, combined_args)
+
+                # Critic repetition check: explicitly ask critic to identify repetition
+                critic_prompt_override = None
+                if self.critic_repetition_check and round_num > 1:
+                    critic_prompt_override = (
+                        "Your task is to critique the proposers' arguments. "
+                        "CRITICAL: You must explicitly identify if any proposer repeated points from previous rounds. "
+                        "If you detect repetition, call it out clearly. Do not just critique the arguments "
+                        "themselves — also check for redundancy with what was said before."
+                    )
+
                 critic_result = self.critic.critique(
                     combined_args,
                     topic=base_topic,
                     round_num=round_num,
                     include_search=bool(critic_search_query),
                     search_query=critic_search_query,
+                    prompt_override=critic_prompt_override,
                 )
                 
                 # Format adherence tracking
@@ -607,8 +773,9 @@ class DebateOrchestrator:
                 # Average the scores
                 consensus_score = int((consensus_normal + consensus_swapped) / 2)
                 
-                # Use the verdict from the normal run (or could implement voting logic)
-                verdict = verdict_normal
+                # Use the verdict from the run with higher consensus (less biased)
+                verdict = verdict_normal if consensus_normal >= consensus_swapped else verdict_swapped
+                consensus_score = max(consensus_normal, consensus_swapped)
                 
                 # Store position swap scores in metrics
                 if self.use_info_gain:
@@ -659,7 +826,7 @@ class DebateOrchestrator:
                 "mode": self.mode,
                 "provider": self.config.model_provider,
                 "use_search": self.mode_capabilities["proposer_search"] or self.mode_capabilities["critic_search"],
-                "use_rag": self.mode_capabilities["shared_initial_rag"] or self.mode_capabilities["iterative_rag"],
+                "use_rag": bool(self.rag_service),
                 "proposer_responses": all_proposer_arguments,
                 "critic_responses": all_critic_critiques,
                 "search_results": all_search_results,
@@ -694,7 +861,7 @@ class DebateOrchestrator:
     def _extract_consensus_score(self, judge_response: str) -> int:
         """Extract consensus score from judge response."""
         import re
-        match = re.search(r'consensus.*?(\d+)', judge_response, re.IGNORECASE)
+        match = re.search(r'consensus[\s\S]{0,80}?(\d+)', judge_response, re.IGNORECASE)
         if match:
             score = int(match.group(1))
             return min(max(score, 0), 100)

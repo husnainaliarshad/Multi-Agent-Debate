@@ -1,0 +1,13 @@
+config,model_display,Accuracy,Correct,Total,Accuracy_%
+multi_proposer,LFM 1.2B,80.0,32.0,40,80.0
+multi_proposer,LFM 350M,60.0,24.0,40,60.0
+multi_proposer,Llama 3.2 1B,75.0,30.0,40,75.0
+multi_proposer,Qwen 0.5B,60.0,24.0,40,60.0
+self_critique,LFM 1.2B,70.0,28.0,40,70.0
+self_critique,LFM 350M,45.0,18.0,40,45.0
+self_critique,Llama 3.2 1B,70.0,28.0,40,70.0
+self_critique,Qwen 0.5B,67.5,27.0,40,67.5
+single_agent,LFM 1.2B,57.5,23.0,40,57.5
+single_agent,LFM 350M,47.5,19.0,40,47.5
+single_agent,Llama 3.2 1B,50.0,20.0,40,50.0
+single_agent,Qwen 0.5B,62.5,25.0,40,62.5

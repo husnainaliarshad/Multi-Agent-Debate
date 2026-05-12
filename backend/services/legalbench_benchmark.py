@@ -138,7 +138,8 @@ class LegalBenchBenchmarkService:
             }
         )
 
-        retrieved = self.rag_service.query_structured(query, n_results=n_results)
+        # Filter by benchmark category to avoid cross-corpus contamination
+        retrieved = self.rag_service.query_structured(query, n_results=n_results, category=benchmark_name)
         retrieved_files = [item["relative_path"] for item in retrieved if item.get("relative_path")]
         matched_retrievals = [item for item in retrieved if item.get("relative_path") in gold_files]
         matched_files = sorted({item["relative_path"] for item in matched_retrievals})

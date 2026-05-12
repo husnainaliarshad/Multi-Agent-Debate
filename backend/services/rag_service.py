@@ -17,23 +17,25 @@ class RAGService:
         
         # Initialize ChromaDB
         self.client = chromadb.PersistentClient(path=str(self.db_path))
+
+        # --- ADD THIS LINE BELOW ---
+        self.collection = self.client.get_or_create_collection(name=self.collection_name)
+        # ---------------------------
         
-        # Use a shared embedding function instance to save memory
-        if RAGService._embedding_function is None:
-            print("Loading SentenceTransformer model (all-MiniLM-L6-v2)...")
-            RAGService._embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        
-        self.embedding_function = RAGService._embedding_function
-        
-        self.collection = self.client.get_or_create_collection(
-            name=self.collection_name,
-            embedding_function=self.embedding_function
-        )
+        # Lazy load embedding function - only load when needed
+        self.embedding_function = None
         self._source_cache: Dict[str, str] = {}
         
         # Index documents if collection is empty
         if self.collection.count() == 0:
             self._index_documents()
+            
+    def _get_embedding_function(self):
+        """Lazy load the embedding function only when needed."""
+        if RAGService._embedding_function is None:
+            print("Loading SentenceTransformer model (all-MiniLM-L6-v2)...")
+            RAGService._embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        return RAGService._embedding_function
 
     def _index_documents(self):
         print(f"Indexing documents from {self.corpus_path}...")
@@ -42,6 +44,9 @@ class RAGService:
         documents = []
         metadatas = []
         ids = []
+        
+        # Get embedding function only when needed for indexing
+        embedding_fn = self._get_embedding_function()
         
         for i, file_path in enumerate(txt_files):
             try:
@@ -65,14 +70,14 @@ class RAGService:
                         
                         # Add in batches to avoid memory issues
                         if len(documents) >= 100:
-                            self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
+                            self.collection.add(documents=documents, metadatas=metadatas, ids=ids, embedding_function=embedding_fn)
                             documents, metadatas, ids = [], [], []
             except Exception as e:
                 print(f"Error indexing {file_path}: {e}")
         
         # Add remaining documents
         if documents:
-            self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
+            self.collection.add(documents=documents, metadatas=metadatas, ids=ids, embedding_function=embedding_fn)
         
         print(f"Indexed {self.collection.count()} chunks from {len(txt_files)} documents.")
 
@@ -107,11 +112,17 @@ class RAGService:
         text: str,
         n_results: int = 5,
         max_chunk_chars: Optional[int] = None,
+        category: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Query the vector store and return structured retrieval results."""
+        # Lazy load embedding function only when querying
+        embedding_fn = self._get_embedding_function()
+        where_filter = {"category": category} if category else None
         results = self.collection.query(
             query_texts=[text],
-            n_results=n_results
+            n_results=n_results,
+            where=where_filter,
+            embedding_function=embedding_fn
         )
 
         documents = results.get("documents", [[]])[0]

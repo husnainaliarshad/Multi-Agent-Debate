@@ -1,10 +1,16 @@
 venv/
+backend/venv/
 __pycache__/
 *.pyc
 .env
+.env.*
+.git
 .git/
 data/
 backend/data/
 Documents/
-LegalBench-RAG/
 *.log
+results/figures/
+results/tables/
+repomix-output.xml
+*.pdf

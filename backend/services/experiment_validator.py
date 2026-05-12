@@ -111,7 +111,11 @@ def validate_experiment_results(experiment_id: str) -> Dict[str, Any]:
                 continue
             row_use_search = _to_bool(row["use_search"])
             row_use_rag = _to_bool(row["use_rag"])
-            if row_use_search != expected["use_search"] or row_use_rag != expected["use_rag"]:
+            # Batch experiments force use_rag=False while mode may still name a RAG-oriented preset.
+            rag_mismatch = row_use_rag != expected["use_rag"] and (
+                not expected["use_rag"] or row_use_rag
+            )
+            if row_use_search != expected["use_search"] or rag_mismatch:
                 mismatches.append(
                     {
                         "topic": row.get("topic"),

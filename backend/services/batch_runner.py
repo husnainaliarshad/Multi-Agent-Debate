@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, Optional
 
 from core.agents import DebateOrchestrator
 from core.config import AgentConfig, DebateConfig
-from services.rag_service import RAGService
+from services.knk_dataset import verdict_matches_gold
 
 
 class BatchRunner:
@@ -54,6 +54,9 @@ class BatchRunner:
         "started_at",
         "completed_at",
         "duration_seconds",
+        "knk_puzzle_index",
+        "knk_solution_text",
+        "knk_gold_match",
     ]
 
     def __init__(self, experiment_id: str = None, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
@@ -65,7 +68,6 @@ class BatchRunner:
         self.logs_file = self.results_dir / "experiment_log.json"
         self.runs = []
         self.progress_callback = progress_callback
-        self._shared_rag_service: Optional[RAGService] = None
 
     def run_experiment(self, config: Dict[str, Any]):
         """
@@ -77,9 +79,9 @@ class BatchRunner:
             "model_configs": List[Dict],
             "max_rounds": int,
             "repeats": int,
-            "use_rag": bool,
             "use_search": bool
         }
+        Note: batch experiments never enable LegalBench RAG; results always record use_rag=False.
         """
         experiment_name = config.get("name", "Unnamed Experiment")
         topics = config.get("topics", [])
@@ -89,23 +91,43 @@ class BatchRunner:
         total_runs = len(topics) * len(model_configs) * repeats
 
         print(f"Starting Experiment: {experiment_name} (ID: {self.experiment_id})")
+        knk_gold = config.get("knk_gold") or []
+        if knk_gold:
+            ref_path = self.results_dir / "knk_reference.json"
+            with ref_path.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {"dataset": "K-and-K/knights-and-knaves", "version": 1, "rows": knk_gold},
+                    handle,
+                    indent=2,
+                )
         self._write_log_snapshot(experiment_name, config, status="running", total_runs=total_runs)
 
         current_run = 0
-        for topic in topics:
+        for topic_idx, topic in enumerate(topics):
+            knk_row = knk_gold[topic_idx] if topic_idx < len(knk_gold) else None
             for m_cfg in model_configs:
                 for repeat_index in range(repeats):
                     current_run += 1
                     metadata = self._build_run_metadata(
                         experiment_name=experiment_name,
                         topic=topic,
+                        knk_row=knk_row,
                         model_config=m_cfg,
                         repeat_index=repeat_index,
                         run_index=current_run,
                         total_runs=total_runs,
                         requested_rounds=max_rounds,
-                        default_use_rag=config.get("use_rag", False),
                         default_use_search=config.get("use_search", True),
+                        force_different_proposers=config.get("force_different_proposers", False),
+                        force_different_rounds=config.get("force_different_rounds", False),
+                        critic_repetition_check=config.get("critic_repetition_check", False),
+                        negative_constraints=config.get("negative_constraints", False),
+                        round_specific_topics=config.get("round_specific_topics", False),
+                        temperature_annealing=config.get("temperature_annealing", False),
+                        judge_intervention=config.get("judge_intervention", False),
+                        perspective_rotation=config.get("perspective_rotation", False),
+                        contradiction_detection=config.get("contradiction_detection", False),
+                        early_termination_loop=config.get("early_termination_loop", False),
                     )
                     print(
                         f"[{current_run}/{total_runs}] Running: "
@@ -135,19 +157,29 @@ class BatchRunner:
         self,
         experiment_name: str,
         topic: str,
+        knk_row: Optional[Dict[str, Any]],
         model_config: Dict[str, Any],
         repeat_index: int,
         run_index: int,
         total_runs: int,
         requested_rounds: int,
-        default_use_rag: bool,
         default_use_search: bool,
+        force_different_proposers: bool = False,
+        force_different_rounds: bool = False,
+        critic_repetition_check: bool = False,
+        negative_constraints: bool = False,
+        round_specific_topics: bool = False,
+        temperature_annealing: bool = False,
+        judge_intervention: bool = False,
+        perspective_rotation: bool = False,
+        contradiction_detection: bool = False,
+        early_termination_loop: bool = False,
     ) -> Dict[str, Any]:
         proposer_model = model_config.get("proposer_model", "liquid/lfm2.5-1.2b")
         critic_model = model_config.get("critic_model", proposer_model)
         judge_model = model_config.get("judge_model", proposer_model)
         mode = model_config.get("mode", "hybrid")
-        mode_defaults = self.MODE_DEFAULTS.get(mode, {"use_search": default_use_search, "use_rag": default_use_rag})
+        mode_defaults = self.MODE_DEFAULTS.get(mode, {"use_search": default_use_search, "use_rag": False})
 
         return {
             "experiment_id": self.experiment_id,
@@ -162,8 +194,22 @@ class BatchRunner:
             "proposer_model": proposer_model,
             "critic_model": critic_model,
             "judge_model": judge_model,
-            "use_rag": bool(model_config.get("use_rag", mode_defaults["use_rag"])),
+            "use_rag": False,
             "use_search": bool(model_config.get("use_search", mode_defaults["use_search"])),
+            "force_different_proposers": force_different_proposers,
+            "force_different_rounds": force_different_rounds,
+            "critic_repetition_check": critic_repetition_check,
+            "negative_constraints": negative_constraints,
+            "round_specific_topics": round_specific_topics,
+            "temperature_annealing": temperature_annealing,
+            "judge_intervention": judge_intervention,
+            "perspective_rotation": perspective_rotation,
+            "contradiction_detection": contradiction_detection,
+            "early_termination_loop": early_termination_loop,
+            "knk_puzzle_index": knk_row.get("index") if knk_row else "",
+            "knk_solution_text": knk_row.get("solution_text", "") if knk_row else "",
+            "knk_names": knk_row.get("names", []) if knk_row else [],
+            "knk_solution": knk_row.get("solution", []) if knk_row else [],
         }
 
     def _setup_orchestrator(self, metadata: Dict[str, Any]) -> DebateOrchestrator:
@@ -198,13 +244,18 @@ class BatchRunner:
             num_rounds=metadata["requested_rounds"],
             use_search=metadata["use_search"],
             use_rag=metadata["use_rag"],
-            rag_service=self._get_shared_rag_service() if metadata["use_rag"] else None,
+            rag_service=None,
+            force_different_proposers=metadata.get("force_different_proposers", False),
+            force_different_rounds=metadata.get("force_different_rounds", False),
+            critic_repetition_check=metadata.get("critic_repetition_check", False),
+            negative_constraints=metadata.get("negative_constraints", False),
+            round_specific_topics=metadata.get("round_specific_topics", False),
+            temperature_annealing=metadata.get("temperature_annealing", False),
+            judge_intervention=metadata.get("judge_intervention", False),
+            perspective_rotation=metadata.get("perspective_rotation", False),
+            contradiction_detection=metadata.get("contradiction_detection", False),
+            early_termination_loop=metadata.get("early_termination_loop", False),
         )
-
-    def _get_shared_rag_service(self) -> RAGService:
-        if self._shared_rag_service is None:
-            self._shared_rag_service = RAGService()
-        return self._shared_rag_service
 
     def _build_success_record(
         self,
@@ -222,6 +273,17 @@ class BatchRunner:
         record["duration_seconds"] = round(time.time() - started_ts, 3)
         record["actual_rounds"] = result.get("num_rounds", metadata["requested_rounds"])
         record["event_count"] = len(result.get("events", []))
+        gold = metadata.get("knk_solution_text") or ""
+        judge_blob = (result.get("judge_response") or "") + " " + str(result.get("verdict", "") or "")
+        if gold:
+            record["knk_gold_match"] = 1 if verdict_matches_gold(
+                judge_blob,
+                gold,
+                names=metadata.get("knk_names"),
+                solution=metadata.get("knk_solution"),
+            ) else 0
+        else:
+            record["knk_gold_match"] = ""
         return record
 
     def _build_failure_record(
@@ -242,6 +304,7 @@ class BatchRunner:
             "actual_rounds": 0,
             "num_proposers": 0,
             "event_count": 0,
+            "knk_gold_match": "",
         }
 
     def _save_result_to_csv(self, result: Dict[str, Any]):
@@ -282,6 +345,9 @@ class BatchRunner:
             "started_at": result.get("started_at"),
             "completed_at": result.get("completed_at"),
             "duration_seconds": result.get("duration_seconds"),
+            "knk_puzzle_index": result.get("knk_puzzle_index", ""),
+            "knk_solution_text": result.get("knk_solution_text", ""),
+            "knk_gold_match": result.get("knk_gold_match", ""),
         }
 
         file_exists = self.results_file.is_file()
@@ -309,6 +375,37 @@ class BatchRunner:
         }
         with self.logs_file.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+        self._upsert_experiments_index(experiment_name, status, total_runs)
+
+    def _upsert_experiments_index(self, experiment_name: str, status: str, total_runs: int) -> None:
+        """Persist a name-sorted manifest so experiments are easy to find after restarts."""
+        index_file = self.repo_root / "backend" / "data" / "experiments" / "experiments_index.json"
+        items: Dict[str, Dict[str, Any]] = {}
+        if index_file.is_file():
+            try:
+                raw = json.loads(index_file.read_text(encoding="utf-8"))
+                for e in raw.get("experiments", []):
+                    if e.get("id"):
+                        items[str(e["id"])] = dict(e)
+            except Exception:
+                items = {}
+        items[self.experiment_id] = {
+            "id": self.experiment_id,
+            "name": experiment_name,
+            "status": status,
+            "updated_at": self._utc_now(),
+            "total_runs": int(total_runs),
+            "sort_time": time.time(),
+        }
+        sorted_list = sorted(
+            items.values(),
+            key=lambda x: ((x.get("name") or "").lower(), str(x.get("id", ""))),
+        )
+        index_file.parent.mkdir(parents=True, exist_ok=True)
+        index_file.write_text(
+            json.dumps({"experiments": sorted_list}, indent=2),
+            encoding="utf-8",
+        )
 
     def _emit_progress(self, record: Dict[str, Any]):
         if not self.progress_callback:

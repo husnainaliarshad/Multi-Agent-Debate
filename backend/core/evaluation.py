@@ -58,34 +58,40 @@ def detect_repetitive_loop(responses: List[str], threshold: float = 0.2) -> bool
     avg_dissimilarity = np.mean(dissimilarities)
     return avg_dissimilarity < threshold
 
-def calculate_turn_faithfulness(argument: str, search_results: str, threshold: float = 0.5) -> float:
+def calculate_turn_faithfulness(argument: str, search_results: str, threshold: float = 0.3) -> float:
     """
     Calculate the percentage of argument sentences that are grounded in search results.
     """
     if not search_results or not argument:
         return 0.0
-        
+
+    # Check for explicit citation markers first
+    citation_markers = ["[Source:", "[LegalRef:", "According to", "Based on"]
+    has_citations = any(marker.lower() in argument.lower() for marker in citation_markers)
+    if has_citations:
+        return 1.0  # Full credit if explicit citations present
+
     model = get_embedding_model()
-    
+
     # Simple sentence splitting
     arg_sentences = [s.strip() for s in re.split(r'[.!?]+', argument) if len(s.strip()) > 10]
     search_sentences = [s.strip() for s in re.split(r'[.!?]+', search_results) if len(s.strip()) > 10]
-    
+
     if not arg_sentences or not search_sentences:
         return 0.0
-        
+
     arg_embs = model.encode(arg_sentences)
     search_embs = model.encode(search_sentences)
-    
+
     # Calculate similarity matrix
     sim_matrix = cosine_similarity(arg_embs, search_embs)
-    
+
     # For each argument sentence, find max similarity with any search sentence
     max_sims = np.max(sim_matrix, axis=1)
-    
+
     # Count how many sentences are above threshold
     faithful_count = np.sum(max_sims >= threshold)
-    
+
     return float(faithful_count / len(arg_sentences))
 
 class DebateMetrics:

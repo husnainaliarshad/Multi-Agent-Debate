@@ -1,0 +1,4 @@
+config,Runs,Legal_Consensus,KNK_Accuracy,Faithfulness,Format_Adherence,Latency_s,SPB_Score
+single_agent,200,66.0,54.4,0.6,93.4,47.3,31.2
+self_critique,200,72.2,63.1,0.7,93.4,75.8,20.8
+multi_proposer,200,76.6,68.8,0.7,93.3,89.6,14.8

@@ -80,6 +80,16 @@ def get_recent_debates(limit: int = 10):
     finally:
         db.close()
 
+def get_debate_result_from_db(session_id: str):
+    """Retrieve the full result dict for a session from the database."""
+    db = SessionLocal()
+    try:
+        session = db.query(DebateSession).filter(DebateSession.id == session_id).first()
+        return session.result if session else None
+    finally:
+        db.close()
+
+
 def delete_debate_session(session_id: str):
     """Delete a debate session from the database."""
     db = SessionLocal()

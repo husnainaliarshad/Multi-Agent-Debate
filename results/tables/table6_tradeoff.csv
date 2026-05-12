@@ -1,0 +1,3 @@
+config,legal_consensus_gain_pp,knk_accuracy_gain_pp,latency_multiplier_vs_single,spb_reduction_%
+self_critique,6.2,8.8,1.6,33.4
+multi_proposer,10.6,14.4,1.89,52.7

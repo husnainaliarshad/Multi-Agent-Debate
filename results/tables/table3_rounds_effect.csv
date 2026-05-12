@@ -1,0 +1,7 @@
+rounds,config,Legal_Consensus,KNK_Accuracy,Latency_s
+1,single_agent,64.6,50.0,32.5
+1,self_critique,70.5,57.5,52.5
+1,multi_proposer,73.6,61.3,62.4
+2,single_agent,67.3,58.8,62.2
+2,self_critique,73.8,68.8,99.2
+2,multi_proposer,79.5,76.2,116.7

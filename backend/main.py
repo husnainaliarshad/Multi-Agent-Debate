@@ -1,18 +1,27 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import json
 import requests
+import datetime
+import traceback
+import uuid
+from pathlib import Path
+
+import pandas as pd
+from fastapi.responses import FileResponse
 from core.config import DebateConfig, AgentConfig, Settings, JUDGE_PROFILES
 from core.agents import DebateOrchestrator
-from core.database import init_db, get_debate_events, get_recent_debates, delete_debate_session, save_debate_session
+from core.database import init_db, get_debate_events, get_recent_debates, delete_debate_session, save_debate_session, get_debate_result_from_db
 from dotenv import load_dotenv
 import os
 import threading
 from services.experiment_manager import experiment_manager
+from services.experiment_catalog import build_experiment_catalog
 from services.rag_service import RAGService
 from services.experiment_validator import validate_experiment_results
+from services.knk_dataset import build_experiment_payload, preview_rows
 from services.legalbench_benchmark import legalbench_benchmark_manager
 from services.report_compiler import report_compiler_service
 
@@ -43,6 +52,21 @@ rag_service = RAGService()
 sessions: Dict[str, DebateOrchestrator] = {}
 session_results: Dict[str, Dict[str, Any]] = {}
 session_locks: Dict[str, threading.Lock] = {}
+session_created_at: Dict[str, datetime.datetime] = {}
+
+SESSION_MAX_AGE_HOURS = 24
+
+def cleanup_old_sessions():
+    """Remove in-memory sessions older than SESSION_MAX_AGE_HOURS."""
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=SESSION_MAX_AGE_HOURS)
+    to_remove = [sid for sid, created in session_created_at.items() if created < cutoff]
+    for sid in to_remove:
+        sessions.pop(sid, None)
+        session_results.pop(sid, None)
+        session_locks.pop(sid, None)
+        session_created_at.pop(sid, None)
+    if to_remove:
+        print(f"[Cleanup] Removed {len(to_remove)} stale session(s)")
 
 # Pydantic schemas
 class ProposerConfig(BaseModel):
@@ -70,6 +94,16 @@ class DebateInitRequest(BaseModel):
     use_rag: Optional[bool] = False
     model_provider: Optional[str] = "openai"
     mode: Optional[str] = "hybrid"
+    force_different_proposers: Optional[bool] = False
+    force_different_rounds: Optional[bool] = False
+    critic_repetition_check: Optional[bool] = False
+    negative_constraints: Optional[bool] = False
+    round_specific_topics: Optional[bool] = False
+    temperature_annealing: Optional[bool] = False
+    judge_intervention: Optional[bool] = False
+    perspective_rotation: Optional[bool] = False
+    contradiction_detection: Optional[bool] = False
+    early_termination_loop: Optional[bool] = False
 
 class DebateInitResponse(BaseModel):
     session_id: str
@@ -133,13 +167,24 @@ def init_debate(request: DebateInitRequest):
             use_faithfulness=request.use_faithfulness or True,
             use_summary_relay=request.use_summary_relay or True,
             use_rag=request.use_rag or False,
-            rag_service=rag_service if (request.use_rag or mode_requires_rag) else None
+            rag_service=rag_service if (request.use_rag or mode_requires_rag) else None,
+            force_different_proposers=request.force_different_proposers or False,
+            force_different_rounds=request.force_different_rounds or False,
+            critic_repetition_check=request.critic_repetition_check or False,
+            negative_constraints=request.negative_constraints or False,
+            round_specific_topics=request.round_specific_topics or False,
+            temperature_annealing=request.temperature_annealing or False,
+            judge_intervention=request.judge_intervention or False,
+            perspective_rotation=request.perspective_rotation or False,
+            contradiction_detection=request.contradiction_detection or False,
+            early_termination_loop=request.early_termination_loop or False
         )
         session_id = orchestrator.session_id
         
         # Store session
         sessions[session_id] = orchestrator
         session_locks[session_id] = threading.Lock()
+        session_created_at[session_id] = datetime.datetime.now()
         
         # Run debate in background thread
         thread = threading.Thread(target=run_debate_background, args=(orchestrator, request.topic))
@@ -151,34 +196,66 @@ def init_debate(request: DebateInitRequest):
         raise HTTPException(status_code=500, detail=f"Failed to initialize debate: {str(e)}")
 
 def run_debate_background(orchestrator: DebateOrchestrator, topic: str):
-    """Run debate in background and store results."""
+    """Run debate in background, store results, and auto-save to DB."""
     try:
         result = orchestrator.run_debate(topic)
         session_results[orchestrator.session_id] = result
         print(f"[{orchestrator.session_id}] Debate complete")
+
+        # Auto-save to database
+        try:
+            save_debate_session(
+                session_id=orchestrator.session_id,
+                topic=topic,
+                events=orchestrator.events,
+                result=result
+            )
+            print(f"[{orchestrator.session_id}] Auto-saved to database")
+        except Exception as db_err:
+            print(f"[{orchestrator.session_id}] Auto-save failed: {db_err}")
+
     except Exception as e:
-        session_results[orchestrator.session_id] = {
+        error_result = {
             "error": str(e),
-            "session_id": orchestrator.session_id
+            "session_id": orchestrator.session_id,
+            "traceback": traceback.format_exc()
         }
+        session_results[orchestrator.session_id] = error_result
         print(f"[{orchestrator.session_id}] Error in background thread: {e}")
+
+        # Auto-save error state to database so user can see what happened
+        try:
+            save_debate_session(
+                session_id=orchestrator.session_id,
+                topic=topic,
+                events=orchestrator.events,
+                result=error_result
+            )
+            print(f"[{orchestrator.session_id}] Auto-saved error state to database")
+        except Exception as db_err:
+            print(f"[{orchestrator.session_id}] Auto-save of error state failed: {db_err}")
 
 @app.get("/debate/events/{session_id}")
 def get_debate_events_endpoint(session_id: str):
     """Get all events for a debate session."""
+    cleanup_old_sessions()
     if session_id in sessions:
         orchestrator = sessions[session_id]
         events = orchestrator.events
+        is_complete = session_id in session_results
     else:
         # Try loading from database
         events = get_debate_events(session_id)
         if not events:
             raise HTTPException(status_code=404, detail="Session not found")
+        # If we have a saved result in the DB, mark as complete
+        db_result = get_debate_result_from_db(session_id)
+        is_complete = db_result is not None
     
     return {
         "session_id": session_id,
         "events": events,
-        "complete": session_id in session_results
+        "complete": is_complete
     }
 
 @app.get("/debate/result/{session_id}")
@@ -189,13 +266,16 @@ def get_debate_result(session_id: str, wait_seconds: int = 5):
     
     while session_id not in session_results and (time.time() - start_time) < wait_seconds:
         time.sleep(1)
-        
-    if session_id not in session_results:
-        # Last attempt to load from persistence if it's an old session
-        pass # We'll implement results persistence if needed, but for now events are enough
-        raise HTTPException(status_code=404, detail="Result not available yet")
     
-    return session_results[session_id]
+    if session_id in session_results:
+        return session_results[session_id]
+    
+    # Fallback to database for saved debates
+    db_result = get_debate_result_from_db(session_id)
+    if db_result is not None:
+        return db_result
+    
+    raise HTTPException(status_code=404, detail="Result not available yet")
 
 class SaveDebateRequest(BaseModel):
     session_id: str
@@ -310,14 +390,37 @@ def root():
     return {"status": "running", "message": "Multi-Agent Debate Backend API"}
 
 # Experiment Endpoints
+class KnKDatasetSpec(BaseModel):
+    """Load puzzles from Hugging Face `K-and-K/knights-and-knaves` as experiment topics."""
+
+    config_name: str = "test"
+    split: str = "2ppl"
+    limit: Optional[int] = None
+    offset: int = 0
+    shuffle: bool = False
+    seed: Optional[int] = None
+    add_topic_suffix: bool = True
+
+
 class ExperimentInitRequest(BaseModel):
     name: str
-    topics: List[str]
+    topics: List[str] = Field(default_factory=list)
+    knk_dataset: Optional[KnKDatasetSpec] = None
     model_configs: List[Dict[str, Any]]
     max_rounds: Optional[int] = 1
     repeats: Optional[int] = 1
     use_rag: Optional[bool] = False
     use_search: Optional[bool] = True
+    force_different_proposers: Optional[bool] = False
+    force_different_rounds: Optional[bool] = False
+    critic_repetition_check: Optional[bool] = False
+    negative_constraints: Optional[bool] = False
+    round_specific_topics: Optional[bool] = False
+    temperature_annealing: Optional[bool] = False
+    judge_intervention: Optional[bool] = False
+    perspective_rotation: Optional[bool] = False
+    contradiction_detection: Optional[bool] = False
+    early_termination_loop: Optional[bool] = False
 
 class LegalBenchBenchmarkRunRequest(BaseModel):
     name: Optional[str] = "LegalBench Retrieval Benchmark"
@@ -334,15 +437,46 @@ class ReportCompileRequest(BaseModel):
 def run_experiment_endpoint(request: ExperimentInitRequest):
     """Start a batch experiment."""
     try:
-        experiment_id = experiment_manager.start_experiment(request.dict())
+        if request.knk_dataset:
+            spec = request.knk_dataset
+            knk_gold, topics = build_experiment_payload(
+                config_name=spec.config_name,
+                split=spec.split,
+                offset=spec.offset,
+                limit=spec.limit,
+                shuffle=spec.shuffle,
+                seed=spec.seed,
+                add_topic_suffix=spec.add_topic_suffix,
+            )
+            payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+            payload["topics"] = topics
+            payload["knk_gold"] = knk_gold
+            payload.pop("knk_dataset", None)
+        else:
+            if not request.topics:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Provide a non-empty topics list or knk_dataset to run an experiment.",
+                )
+            payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+
+        experiment_id = experiment_manager.start_experiment(payload)
         return {"experiment_id": experiment_id, "status": "started"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start experiment: {str(e)}")
 
 @app.get("/experiments/list")
 def list_experiments_endpoint():
-    """List all experiments."""
+    """List in-process experiments (sorted by name)."""
     return {"experiments": experiment_manager.list_experiments()}
+
+
+@app.get("/experiments/catalog")
+def experiments_catalog_endpoint():
+    """All experiments sorted by display name: live runs + disk index + log scan."""
+    return {"experiments": build_experiment_catalog()}
 
 @app.get("/experiments/status/{experiment_id}")
 def get_experiment_status_endpoint(experiment_id: str):
@@ -359,6 +493,66 @@ def validate_experiment_endpoint(experiment_id: str):
         return validate_experiment_results(experiment_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to validate experiment: {str(e)}")
+
+
+def _experiment_results_csv_path(experiment_id: str) -> Path:
+    """Resolve results.csv for a UUID experiment folder (no path traversal)."""
+    exp_uuid = str(uuid.UUID(experiment_id))
+    base = Path(__file__).resolve().parent / "data" / "experiments"
+    csv_path = (base / exp_uuid / "results.csv").resolve()
+    if not str(csv_path).startswith(str(base.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    return csv_path
+
+
+@app.get("/experiments/{experiment_id}/results")
+def get_experiment_results_json(experiment_id: str):
+    """Return experiment `results.csv` as JSON (columns + rows)."""
+    try:
+        csv_path = _experiment_results_csv_path(experiment_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid experiment id")
+    if not csv_path.is_file():
+        raise HTTPException(status_code=404, detail="results.csv not found for this experiment")
+    df = pd.read_csv(csv_path)
+    # Round-trip through pandas JSON so NaN/Inf become null (stdlib json cannot encode float nan).
+    rows = json.loads(df.to_json(orient="records", date_format="iso", default_handler=str))
+    return {
+        "experiment_id": str(uuid.UUID(experiment_id)),
+        "columns": [str(c) for c in df.columns],
+        "rows": rows,
+        "row_count": int(len(df)),
+    }
+
+
+@app.get("/experiments/{experiment_id}/results.csv")
+def download_experiment_results_csv(experiment_id: str):
+    """Download raw `results.csv` for an experiment."""
+    try:
+        csv_path = _experiment_results_csv_path(experiment_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid experiment id")
+    if not csv_path.is_file():
+        raise HTTPException(status_code=404, detail="results.csv not found for this experiment")
+    exp_uuid = str(uuid.UUID(experiment_id))
+    return FileResponse(
+        path=str(csv_path),
+        filename=f"experiment_{exp_uuid}_results.csv",
+        media_type="text/csv",
+    )
+
+@app.get("/benchmarks/knk/preview")
+def knk_preview_endpoint(
+    config_name: str = "test",
+    split: str = "2ppl",
+    limit: int = 5,
+    offset: int = 0,
+):
+    """Preview rows from `K-and-K/knights-and-knaves` (requires `datasets` package and network on first load)."""
+    try:
+        return preview_rows(config_name=config_name, split=split, limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load K&K dataset: {str(e)}")
 
 @app.get("/benchmarks/legalbench/datasets")
 def list_legalbench_datasets_endpoint():
@@ -389,6 +583,60 @@ def get_legalbench_benchmark_status_endpoint(run_id: str):
 def list_legalbench_benchmark_runs_endpoint():
     """List LegalBench retrieval benchmark runs started in this process."""
     return {"runs": legalbench_benchmark_manager.list_runs()}
+
+class BenchmarkRunRequest(BaseModel):
+    benchmarks: list[str]
+    queries_per_benchmark: int = 10
+
+@app.post("/benchmarks/run")
+def run_benchmark_endpoint(request: BenchmarkRunRequest):
+    """Run LegalBench benchmarks on demand."""
+    try:
+        from services.rag_service import RAGService
+        from services.legalbench_benchmark import LegalBenchBenchmarkService
+        
+        rag_service = RAGService()
+        benchmark_service = LegalBenchBenchmarkService(rag_service=rag_service)
+        
+        config = {
+            "benchmarks": request.benchmarks,
+            "limit_per_benchmark": request.queries_per_benchmark,
+            "n_results": 5
+        }
+        
+        result = benchmark_service.run_suite(config)
+        
+        # Simplify result for frontend - map actual metric names
+        overall = result.get("overall", {})
+        overall_precision = overall.get("file_precision_at_k", 0)
+        overall_recall = overall.get("file_recall_at_k", 0)
+        overall_f1 = 2 * (overall_precision * overall_recall) / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0
+        
+        simplified = {
+            "overall": {
+                "avg_precision": overall_precision,
+                "avg_recall": overall_recall,
+                "overall_f1": overall_f1
+            },
+            "benchmarks": []
+        }
+        
+        for bench in result.get("benchmarks", []):
+            precision = bench.get("file_precision_at_k", 0)
+            recall = bench.get("file_recall_at_k", 0)
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            
+            simplified["benchmarks"].append({
+                "name": bench.get("benchmark", "Unknown"),
+                "avg_precision": precision,
+                "avg_recall": recall,
+                "f1_score": f1,
+                "num_queries": bench.get("queries_evaluated", 0)
+            })
+        
+        return simplified
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to run benchmarks: {str(e)}")
 
 @app.get("/reports/sources")
 def list_report_sources_endpoint():

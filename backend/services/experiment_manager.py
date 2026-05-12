@@ -84,7 +84,14 @@ class ExperimentManager:
         return self.experiments.get(experiment_id, {"status": "not_found"})
 
     def list_experiments(self) -> List[Dict[str, Any]]:
-        return list(self.experiments.values())
+        rows = list(self.experiments.values())
+        rows.sort(
+            key=lambda e: (
+                (e.get("name") or "zzz").lower(),
+                -float(e.get("start_time") or 0),
+            )
+        )
+        return rows
 
 
 experiment_manager = ExperimentManager()
